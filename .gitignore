@@ -80,7 +80,7 @@ Thumbs.db
 /milestone-four.txt
 /milestone-six-scheduler-completion.txt
 /review/
-
+/AGENTS.md
 # Project scripts are source files (override broad global ignore rules).
 !/scripts/*.sh
 
