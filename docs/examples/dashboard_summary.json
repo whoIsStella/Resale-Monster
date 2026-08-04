@@ -1,0 +1,10 @@
+{
+  "inventory_by_status": {"draft": 3, "research_needed": 2, "ready_for_listing": 1},
+  "research_by_status": {"pending": 1, "completed": 2, "inconclusive": 1},
+  "proposals_by_status": {"pending": 2, "executed": 4},
+  "review_tasks_by_status": {"open": 5, "claimed": 1, "completed": 12},
+  "comparables_pending_review": 7,
+  "media_failures": 1,
+  "workers": 2,
+  "generated_at": "2026-08-03T00:00:00+00:00"
+}

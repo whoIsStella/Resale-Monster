@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "goliath-http": {
+      "url": "http://127.0.0.1:8900/mcp",
+      "transport": "http",
+      "headers": {
+        "Authorization": "Bearer mcp_REPLACE_WITH_ISSUED_SERVICE_PRINCIPAL_CREDENTIAL"
+      }
+    }
+  },
+  "_notes": "HTTP transport must remain loopback unless authentication is enabled and the non-loopback override is explicitly set in config. The credential is a hashed-at-rest MCP service-principal secret; never commit a real value. No marketplace credentials are ever exposed over MCP."
+}

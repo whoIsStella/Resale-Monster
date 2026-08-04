@@ -77,6 +77,26 @@ class CapabilityName(StrEnum):
     APPROVAL_REQUEST_CREATION = "approval_request_creation"
 
 
+# Scopes that only human review principals may hold. MCP service principals and
+# worker identities must never be granted these; enforced at principal creation.
+HUMAN_ONLY_SCOPES: frozenset[str] = frozenset({"reviews:write", "comparables:review"})
+
+# Full set of milestone-five API scopes.
+DASHBOARD_API_SCOPES: frozenset[str] = frozenset(
+    {
+        "media:read",
+        "media:write",
+        "media:process",
+        "comparables:read",
+        "comparables:write",
+        "comparables:review",
+        "dashboard:read",
+        "reviews:read",
+        "reviews:write",
+    }
+)
+
+
 KNOWN_FORBIDDEN_ACTIONS = frozenset(
     {
         "publish_listing",

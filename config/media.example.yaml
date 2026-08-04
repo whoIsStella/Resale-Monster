@@ -1,0 +1,22 @@
+# Milestone-five media configuration (nested under domain.media in agents.yaml).
+domain:
+  media:
+    media_root: /srv/resale-goliath/media
+    quarantine_root: /srv/resale-goliath/quarantine
+    temp_upload_root: /srv/resale-goliath/tmp
+    allowed_mime_types: [image/jpeg, image/png, image/webp]
+    allowed_extensions: [.jpg, .jpeg, .png, .webp]
+    max_file_bytes: 25000000
+    max_image_dimension: 12000
+    min_image_dimension: 200
+    thumbnail_dimension: 256
+    preview_dimension: 1024
+    jpeg_quality: 85
+    pad_square_canvas: false
+    processing_max_attempts: 3
+    processing_backoff_seconds: 5
+    blur_variance_threshold: 50
+    max_aspect_ratio: 4
+  analysis_provider:
+    enabled: false
+    provider: fake

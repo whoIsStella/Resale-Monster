@@ -86,7 +86,8 @@ def _principal(factory, scopes):
 
 def test_all_initial_tools_present(server) -> None:
     srv, _ = server
-    assert set(srv.tool_names()) == EXPECTED_TOOLS
+    # The milestone-four resale tools remain present (later milestones add more).
+    assert EXPECTED_TOOLS <= set(srv.tool_names())
 
 
 def test_forbidden_tools_are_absent(server) -> None:

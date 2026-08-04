@@ -3,10 +3,11 @@
 A safe, local-first resale operations foundation with persistent orchestration for Codex CLI,
 Hermes, and configurable command-line agents.
 
-Agents can inspect approved files, draft code inside approved engineering workspaces, run approved
-commands, and return structured results. They cannot publish listings, change live prices, accept
-offers, issue refunds, contact buyers, access payouts, receive marketplace credentials, or execute
-unrestricted production SQL.
+General coding agents can inspect approved engineering files, draft code, run approved commands,
+and return structured results. Separately authorized operations agents can request typed marketplace
+reads and writes through Goliath's deterministic policy gateway. No agent can receive marketplace
+credentials, browser profiles, cookies, payout access, unrestricted SQL, or unrestricted browser
+controls.
 
 ## Linux setup
 
@@ -142,8 +143,8 @@ terminal transition. The rejected transition is reported rather than overwriting
 - Agent processes receive only allowlisted, non-secret environment values.
 - Prompts and audit metadata never contain full environments or credentials.
 - Production data and engineering workspaces remain separate.
-- No live marketplace mutation, buyer messaging, payout handling, or marketplace credential code
-  exists in this milestone.
+- Live commerce mutations are available only through the Milestone Six marketplace gateway below;
+  ordinary engineering jobs still have no such authority.
 
 ## Development and migrations
 
@@ -379,6 +380,166 @@ without a stack trace.
 - **Media path rejected:** the storage path resolved outside `media_storage_root`.
 - **No eligible domain agent:** the preferred agent is disabled or missing a required MCP scope.
 
+## Milestone five: ingestion, imaging, and review dashboard
+
+Milestone five turns the domain layer into a usable ingestion and review system.
+It never publishes listings, changes live prices, contacts buyers, accepts offers, issues refunds,
+purchases labels, handles payouts, exposes marketplace credentials, or scrapes marketplaces.
+
+### MCP protocol setup
+
+`goliath/mcp/protocol.py` implements a standards-compliant MCP JSON-RPC 2.0 layer:
+`initialize` with protocol-version negotiation and capability reporting, `tools/list`, `tools/call`,
+`resources/list`, `resources/read`, `prompts/list`, `prompts/get`, `ping`, `notifications/cancelled`,
+and graceful `shutdown`. It preserves the bounded tool surface, service-principal authentication,
+scope enforcement, audit events, resource-version checks, and forbidden-tool absence. Run it over
+stdio:
+
+```bash
+GOLIATH_MCP_CREDENTIAL=mcp_... python -m goliath.mcp --transport stdio
+python -m goliath.mcp --list-tools    # manifest only
+```
+
+Read-only MCP **resources** expose non-sensitive summaries (`goliath://inventory/{id}/summary`,
+`goliath://research/{id}`, `goliath://listing-drafts/approved`, `goliath://pricing/{id}/recommendations`,
+`goliath://completeness/{id}`, `goliath://approvals/queue`), each scope-enforced and audited.
+Bounded **prompts** (`product_identification`, `comparable_research`, `listing_draft_generation`,
+`stale_inventory_review`, `inventory_completeness_review`) contain no secrets and escape arguments.
+
+### Hermes MCP configuration
+
+See `config/mcp-hermes.example.json` (stdio) and `config/mcp-http.example.json` (authenticated HTTP).
+HTTP binding stays loopback unless authentication is enabled and the non-loopback override is set.
+
+### Media ingestion and storage layout
+
+Uploads (multipart API, CLI, filesystem, or pre-existing registration) are validated without trusting
+client MIME/filenames: magic-byte sniffing, MIME/extension allowlists, size and dimension limits, and
+filename sanitization. Bytes are written **atomically** (temp file + `os.replace`) under a generated,
+non-user-controlled storage key `{{item}}/{{ab}}/{{checksum}}.{{ext}}`; derivations live under
+`derived/`. Checksum duplicates are collapsed. Roots (`media_root`, `quarantine_root`,
+`temp_upload_root`) must be distinct and non-overlapping. No cloud credentials are used. See
+`config/media.example.yaml`.
+
+### Quarantine behavior
+
+Files that fail validation (unrecognized/disallowed MIME, declared-MIME mismatch, disallowed
+extension, or corrupt bytes) are written to the quarantine root, marked `quarantined`, and raise a
+`media_validation` review task. They never enter processing.
+
+### Image processing
+
+Deterministic, Pillow-backed operations run through durable, leased jobs (retries, exponential
+backoff, crash recovery via lease reaping, idempotent derivation naming): EXIF-orientation
+normalization, metadata stripping, format normalization, thumbnail and marketplace-preview generation
+(aspect-preserving, optional square padding), average perceptual hashing (duplicate detection), and a
+quality gate (min dimensions, blur variance, exposure placeholders, extreme aspect ratio, corrupt
+files, unsupported color modes). Every generated image keeps a parent-child derivation record.
+Processing runs out of band — never synchronously inside API request handlers.
+
+### Optional analysis providers
+
+`goliath/domain/providers.py` defines an `ImageAnalysisProvider` interface with a disabled default and
+a deterministic fake for tests. Output is treated as suggestions with confidence and requires human
+review; it never mutates final inventory fields. No external vendor is hard-coded and no network is
+required.
+
+### Comparable import and review
+
+CSV/JSON import validates every row (marketplace, title, sold/active state, prices, currency, date,
+URL, size, condition) and records a status for each — nothing is silently discarded. Supports dry run,
+partial import, all-or-nothing rollback, duplicate detection, idempotency, and audit events. Imported
+comparables enter a review queue (`pending_review` → `accepted`/`rejected`/`duplicate`/`invalidated`);
+reviewers adjust similarity/reliability and add notes, individually or in bulk. See
+`docs/examples/comparables.csv` and `docs/examples/comparables.json`.
+
+### Pricing-source policies
+
+`recommend_price_with_policy` applies a versioned, configuration-driven policy (`reviewed-only`,
+minimum count, maximum age, marketplace/sold-vs-active weighting, reliability and similarity
+thresholds, z-score outlier handling, currency restriction, fallback). By default only reviewed
+comparables feed pricing. Every recommendation persists the policy version and lists included and
+excluded comparables with reasons. See `docs/examples/pricing_source_policy.json`.
+
+### Review tasks and workflow
+
+A generalized `ReviewTask` (types: inventory_completion, media_validation, image_quality,
+research_resolution, comparable_review, pricing_review, listing_review, proposal_review) is created
+idempotently when completeness blocks readiness, media is quarantined, image processing fails,
+research is inconclusive, comparables need review, pricing confidence is low, listing validation has
+blocking errors, or a proposal needs approval. Tasks are claimed with an atomic compare-and-swap so
+two reviewers cannot claim the same task. See `docs/examples/review_task.json`.
+
+### Dashboard endpoints
+
+```text
+GET /dashboard/summary | /tasks | /inventory-needing-review | /research-needing-review
+GET /dashboard/comparables-needing-review | /listings-needing-review | /approvals
+GET /dashboard/media-failures | /worker-health
+```
+
+All are `dashboard:read`-scoped, paginated where applicable, with stable schemas and request IDs. See
+`docs/examples/dashboard_summary.json`.
+
+### API examples
+
+```bash
+curl -H "Authorization: Bearer $KEY" -F file=@photo.jpg -F role=original \
+  http://127.0.0.1:8000/media/$ITEM/upload
+curl -H "Authorization: Bearer $KEY" -X POST http://127.0.0.1:8000/media/$MEDIA/process
+curl -H "Authorization: Bearer $KEY" -d '{"item_id":"'$ITEM'","source_format":"csv","content":"..."}' \
+  http://127.0.0.1:8000/comparables/import
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8000/dashboard/summary
+```
+
+### CLI examples
+
+```bash
+goliath media ingest ITEM_ID photo.jpg
+goliath media process           # claim and process one queued media job
+goliath media quarantine-list
+goliath comparables import ITEM_ID comps.csv --dry-run
+goliath comparables review-list
+goliath comparables accept COMPARABLE_ID
+goliath review list
+goliath review claim TASK_ID
+goliath review complete TASK_ID
+goliath dashboard summary
+```
+
+### API scopes (milestone five)
+
+`media:read`, `media:write`, `media:process`, `comparables:read`, `comparables:write`,
+`comparables:review`, `dashboard:read`, `reviews:read`, `reviews:write`. Human principals, MCP service
+principals, and worker identities stay separate; service principals may **never** hold the human-only
+scopes `reviews:write` or `comparables:review` (enforced at principal creation).
+
+### systemd integration
+
+The example units under `systemd/` cover the API, worker, and scheduler. A media-processing loop can
+reuse the worker pattern by invoking `goliath media process` on a timer; the MCP server runs as a
+stdio subprocess of the agent host (Hermes), not as a system service.
+
+### Security boundaries (milestone five)
+
+- Uploaded filenames and MIME declarations are never trusted; paths cannot traverse configured roots.
+- No marketplace scraping, buyer messaging, refunds, payouts, label purchase, live mutation, or
+  marketplace credentials exist.
+- Analysis and comparable providers are suggestions only; humans review and approve.
+- Audit/log events never contain raw file bytes, credentials, tokens, buyer data, full EXIF, or
+  private prompts.
+
+### Troubleshooting (milestone five)
+
+- **Upload quarantined:** check `validation_result.findings`; the true MIME did not match the
+  allowlist, the declared MIME, or the extension, or the bytes were corrupt.
+- **Media job stuck running:** run the reaper (`ImageProcessingService.reap`) to requeue expired
+  leases; check `goliath_media_jobs`.
+- **Comparable excluded from pricing:** inspect the recommendation's `excluded_comparables` reasons
+  (e.g. `not_reviewed`, `too_old`, `reliability_below_threshold`, `price_outlier`).
+- **Review task won't claim:** it was already claimed or is no longer open; refetch its version.
+- **MCP HTTP rejected:** non-loopback binding requires authentication and the explicit override.
+
 ## Troubleshooting
 
 - **Agent unavailable:** run `goliath agent doctor`; verify the executable path and `PATH` allowlist.
@@ -390,3 +551,141 @@ without a stack trace.
   single-job worker command, not a continuously running daemon.
 - **Output marked truncated:** raise configured and per-job limits within the configured maximum;
   original character counts identify how much output the process produced.
+
+## Milestone Six: zero-touch marketplace operations
+
+Milestone Six adds a separate operational control plane. An authorized Hermes operations principal
+may request a typed operation, but deterministic application code remains responsible for policy,
+state, numeric, idempotency, health, rate-limit, circuit-breaker, emergency-stop, execution, and
+verification decisions.
+
+```text
+Hermes operations principal -> typed MCP tool -> marketplace gateway -> session broker
+                                                            -> isolated adapter -> marketplace
+                                                            -> verification -> persistence/audit
+```
+
+New accounts are `disabled`. `observe` permits synchronization only, `shadow` records proposed
+writes, `autonomous_conservative` uses stricter limits, `autonomous_normal` executes enabled routine
+work, and `paused` preserves safe reads while blocking writes. Modes are stored with optimistic
+versions and append-only audit events. Global and per-account emergency stops and scoped circuit
+breakers block writes without stopping reads.
+
+### Adapters and isolated authentication
+
+The async adapter contract covers health, authentication, account/listing/order/offer/message reads,
+listing creation and engagement, offer responses, messaging, tracking, fee/shipping queries, label
+purchase, and synchronization. Every adapter declares capabilities and returns classified typed
+results. Unsupported operations fail closed. The complete in-memory fake and manual export adapter
+make tests and offline workflows deterministic. eBay, Poshmark, Depop, Mercari, Grailed, and
+Facebook each have a distinct Playwright subclass; selectors and workflows remain marketplace-local.
+
+The session broker encrypts Playwright storage state with Fernet. Each account receives a generated
+`0700` directory below the configured session root, outside every agent workspace. Decryption occurs
+only while provisioning the adapter; the Playwright foundation passes decoded storage state to an
+isolated in-memory browser context and never writes plaintext cookies to disk. Navigation is domain
+allowlisted. Goliath never uses a normal browser profile, bypasses CAPTCHA/2FA/challenges, or exports
+session data through API, MCP, audit, logs, or metrics.
+
+```bash
+pip install -e '.[browser]'
+playwright install chromium
+goliath marketplace authenticate ACCOUNT_ID --session-state /secure/operator/storage-state.json
+```
+
+Remove the operator-controlled input file from its temporary secure location after import. Never put
+it in this repository or an agent workspace. See `config/marketplace.example.yaml` for fake,
+Playwright, conservative, normal, publishing, cross-listing, offer, message, pricing, shipping,
+refund, breaker, emergency-stop, and Hermes examples.
+
+### Publishing, cross-posting, and engagement
+
+Publishing starts only from `ready_for_listing` inventory with approved content, usable images,
+current deterministic pricing, sufficient expected profit, a healthy capable account, no active
+reservation or duplicate, and no stop or breaker. Inventory is the source of truth. Each account has
+an independent idempotency key and listing row, so cross-posting can partially succeed and retry only
+failed targets. `single`, `preferred`, `all_eligible`, and category strategies are bounded by an
+active-listing maximum. A publish succeeds only after reading back the exact idempotent listing.
+
+Refresh, share, promotion, watcher offers, price updates, and end operations are capability-gated.
+Engagement and markdown clocks are persisted per listing. Price reductions use Decimal arithmetic,
+minimum profit, daily and total movement caps, cooldowns, stale-age thresholds, marketplace rounding,
+and reservation checks. Relisting must end and verify the old listing before creating a replacement;
+donation, disposal, and destructive archival remain exception actions.
+
+### Offers, messages, sales, and duplicate prevention
+
+Agents may initiate offer actions, but the deterministic engine owns minimum proceeds, profit,
+margin, maximum discount, and counter boundaries. High-value, reserved, disputed, or unmatched cases
+escalate. Routine buyer messages use allowed factual categories and body checksums; threats, legal or
+counterfeit claims, fraud, chargebacks, off-platform payment, personal-contact requests, tracking
+disputes, and unusual refunds create exceptions. Responses never include costs, internal notes,
+credentials, or another buyer's data.
+
+Order synchronization uses `(account_id, remote_order_id)` idempotent upserts and buyer-safe hashes.
+A paid sale atomically reserves inventory, stops incompatible automation, creates a shipping task,
+ends every active copy, verifies each end, retries a failed end once, and marks inventory sold only
+after all copies are inactive. Exceeding the delisting target opens an item breaker and an urgent
+duplicate-sale exception while reconciliation continues.
+
+### Shipping, refunds, and reconciliation
+
+Shipping tasks preserve location, package profile, weights, dimensions, ship-by time, label reference,
+tracking, carrier, and optimistic version. Automatic label purchase requires a paid order, complete
+package data, adapter support, idempotency, and a maximum cost carried into the adapter request before
+purchase. Higher-weight packages require confirmed packed weight. Tracking is verified by read-back.
+
+Refund policy evaluation is deterministic and limited to explicitly configured routine reasons and
+an amount ceiling; disputes, legal/counterfeit/chargeback cases and larger amounts remain exceptions.
+Financial reconciliation uses Decimal arithmetic for sale, tax, shipping, fees, cost, refunds, net
+proceeds, realized profit, and margin. Missing fees, unexpected shipping costs, and refund mismatches
+create discrepancy records and exceptions.
+
+### Agent authority, API, and CLI
+
+Marketplace MCP scopes are separate from engineering permissions. A scope can be limited to one
+account as `marketplace:listing:create@ACCOUNT_UUID`; both MCP and the gateway enforce it. Coding
+adapters are rejected if configured with marketplace scopes. The `marketplace.*` tools never return a
+session reference, browser object, or buyer/session secret.
+
+```bash
+goliath automation status --json
+goliath automation stop --reason "Account challenge"
+goliath automation start --reason "Challenge resolved"
+goliath marketplace account-list --json
+goliath marketplace mode ACCOUNT_ID autonomous-normal
+goliath marketplace sync ACCOUNT_ID
+goliath listing publish APPROVED_DRAFT_ID
+goliath listing refresh LISTING_ID
+goliath listing promote LISTING_ID
+goliath listing end LISTING_ID
+goliath listing sync LISTING_ID --json
+goliath order sync
+goliath offer list
+goliath message list
+goliath shipping purchase-label TASK_ID
+goliath reconcile run
+goliath breaker list
+```
+
+API routes mirror these commands under `/automation`, `/marketplace-accounts`,
+`/marketplace-listings`, `/orders`, `/offers`, `/messages`, `/shipping/tasks`, `/reconciliation`, and
+`/circuit-breakers`. Operational writes pass authentication, scope, policy, mode, health,
+idempotency, stop, breaker, capability, version, audit, and verification gates and return typed
+receipts.
+
+### Deployment, renewal, and troubleshooting
+
+Use the API, worker, and scheduler examples under `systemd/`. Set `GOLIATH_SESSION_KEY` in a root-owned
+service environment file, use PostgreSQL in production, place sessions outside the checkout, and
+grant that root only to the Goliath service user. Database-persisted stops are visible before every
+write; read-only synchronization continues.
+
+- `authentication_required`: renew isolated storage state; do not retry writes.
+- `challenged` or `suspended`: resolve the challenge manually; no bypass is attempted.
+- `verification_failed`: inspect remote state and idempotency before retrying.
+- `rate_limited`: honor reset state and never increase request pressure.
+- open breaker: resolve and reconcile the cause, then use `goliath breaker reset`.
+- duplicate-sale risk: verify every remote listing is inactive before resetting the item breaker.
+- label cost exception: select another service or explicitly adjust the bounded ceiling.
+- session-root validation: move sessions outside all agent workspaces and restrict permissions.

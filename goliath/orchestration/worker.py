@@ -32,11 +32,14 @@ class WorkerDaemon:
         registry: AgentRegistry,
         config: OrchestrationConfig,
         worker_id: str | None = None,
+        marketplace_worker=None,
     ) -> None:
         self.session_factory = session_factory
         self.registry = registry
         self.config = config
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.marketplace_worker = marketplace_worker
+        self._marketplace_tick_running = False
         self._stop = asyncio.Event()
         self._draining = False
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -67,6 +70,14 @@ class WorkerDaemon:
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             while not self._draining:
+                if self.marketplace_worker is not None and not self._marketplace_tick_running:
+                    self._marketplace_tick_running = True
+                    try:
+                        await self.marketplace_worker.run_once()
+                    except Exception:
+                        logger.exception("marketplace_maintenance_failed")
+                    finally:
+                        self._marketplace_tick_running = False
                 self._tasks = {task for task in self._tasks if not task.done()}
                 while len(self._tasks) < self.config.worker_concurrency and not self._draining:
                     task = await self._claim_task()

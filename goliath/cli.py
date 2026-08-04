@@ -40,6 +40,18 @@ research_app = typer.Typer(no_args_is_help=True, help="Manage product research."
 pricing_app = typer.Typer(no_args_is_help=True, help="Deterministic pricing.")
 listing_app = typer.Typer(no_args_is_help=True, help="Manage listing drafts and variants.")
 approval_app = typer.Typer(no_args_is_help=True, help="Review domain proposals.")
+media_app = typer.Typer(no_args_is_help=True, help="Ingest and process media.")
+comparables_app = typer.Typer(no_args_is_help=True, help="Import and review comparables.")
+review_app = typer.Typer(no_args_is_help=True, help="Human review tasks.")
+dashboard_app = typer.Typer(no_args_is_help=True, help="Review dashboard.")
+automation_app = typer.Typer(no_args_is_help=True, help="Automation and emergency stop.")
+marketplace_app = typer.Typer(no_args_is_help=True, help="Manage marketplace accounts.")
+order_app = typer.Typer(no_args_is_help=True, help="Marketplace orders.")
+offer_app = typer.Typer(no_args_is_help=True, help="Marketplace offers.")
+message_app = typer.Typer(no_args_is_help=True, help="Buyer messages.")
+shipping_app = typer.Typer(no_args_is_help=True, help="Shipping tasks and labels.")
+reconcile_app = typer.Typer(no_args_is_help=True, help="Financial reconciliation.")
+breaker_app = typer.Typer(no_args_is_help=True, help="Circuit breakers.")
 app.add_typer(agent_app, name="agent")
 app.add_typer(job_app, name="job")
 app.add_typer(worker_app, name="worker")
@@ -50,6 +62,18 @@ app.add_typer(research_app, name="research")
 app.add_typer(pricing_app, name="pricing")
 app.add_typer(listing_app, name="listing")
 app.add_typer(approval_app, name="approval")
+app.add_typer(media_app, name="media")
+app.add_typer(comparables_app, name="comparables")
+app.add_typer(review_app, name="review")
+app.add_typer(dashboard_app, name="dashboard")
+app.add_typer(automation_app, name="automation")
+app.add_typer(marketplace_app, name="marketplace")
+app.add_typer(order_app, name="order")
+app.add_typer(offer_app, name="offer")
+app.add_typer(message_app, name="message")
+app.add_typer(shipping_app, name="shipping")
+app.add_typer(reconcile_app, name="reconcile")
+app.add_typer(breaker_app, name="breaker")
 
 
 @dataclass(slots=True)
@@ -265,10 +289,16 @@ def worker_start() -> None:
     try:
         runtime = build_runtime()
         engine = create_production_engine()
+        factory = build_session_factory(engine)
+        from goliath.marketplace.service import MarketplaceService
+        from goliath.marketplace.worker import MarketplaceAutomationWorker
+
+        marketplace_service = MarketplaceService(session_factory=factory, config=runtime.config)
         daemon = WorkerDaemon(
-            session_factory=build_session_factory(engine),
+            session_factory=factory,
             registry=runtime.registry,
             config=runtime.config,
+            marketplace_worker=MarketplaceAutomationWorker(marketplace_service),
         )
 
         async def run_worker() -> None:
@@ -787,6 +817,607 @@ def approval_reject(
             {"id": str(p.id), "status": p.status.value},
             json_output=json_output,
             human=f"{p.id} {p.status.value}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+# --------------------------------------------------------------------------- #
+# Milestone five: media, comparables, review, dashboard CLI
+# --------------------------------------------------------------------------- #
+
+
+def build_media_service():
+    from goliath.domain.media_service import MediaIngestionService
+
+    config = load_config()
+    engine = create_production_engine()
+    return MediaIngestionService(session_factory=build_session_factory(engine), config=config)
+
+
+def build_image_processing_service():
+    from goliath.domain.media_service import ImageProcessingService
+
+    config = load_config()
+    engine = create_production_engine()
+    return ImageProcessingService(session_factory=build_session_factory(engine), config=config)
+
+
+def build_review_service():
+    from goliath.domain.review_service import ReviewService
+
+    config = load_config()
+    engine = create_production_engine()
+    return ReviewService(session_factory=build_session_factory(engine), config=config)
+
+
+def build_comparable_import_service():
+    from goliath.domain.comparables import ComparableImportService
+
+    config = load_config()
+    engine = create_production_engine()
+    return ComparableImportService(session_factory=build_session_factory(engine), config=config)
+
+
+@media_app.command("ingest")
+def media_ingest(
+    item_id: UUID,
+    file: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    role: Annotated[str, typer.Option()] = "original",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    from goliath.db.models import MediaRole
+
+    try:
+        service = build_media_service()
+        media = service.ingest_bytes(
+            item_id,
+            file.read_bytes(),
+            role=MediaRole(role),
+            original_filename=file.name,
+            actor="human:cli",
+        )
+        _emit_json(
+            {"id": str(media.id), "status": media.status.value},
+            json_output=json_output,
+            human=f"{media.id} {media.status.value}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@media_app.command("list")
+def media_list(
+    item_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    try:
+        svc = build_domain_service()
+        rows = [
+            {"id": str(m.id), "status": m.status.value, "role": m.role.value}
+            for m in svc.list_media(item_id)
+        ]
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['status']}  {r['role']}" for r in rows),
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@media_app.command("process")
+def media_process(
+    media_id: Annotated[UUID | None, typer.Argument()] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        service = build_image_processing_service()
+        if media_id is not None:
+            service.enqueue(media_id)
+        processed = service.run_next()
+        _emit_json(
+            {"processed": str(processed) if processed else None},
+            json_output=json_output,
+            human=f"processed {processed}" if processed else "no queued media jobs",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@media_app.command("quarantine-list")
+def media_quarantine_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        service = build_media_service()
+        rows = [
+            {"id": str(m.id), "findings": m.validation_result.get("findings", [])}
+            for m in service.list_quarantined()
+        ]
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['findings']}" for r in rows),
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@media_app.command("archive")
+def media_archive(
+    media_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    try:
+        media = build_media_service().archive(media_id, actor="human:cli")
+        _emit_json(
+            {"id": str(media.id), "status": media.status.value},
+            json_output=json_output,
+            human=f"{media.id} {media.status.value}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@comparables_app.command("import")
+def comparables_import(
+    item_id: UUID,
+    file: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    source_format: Annotated[str, typer.Option()] = "csv",
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    from goliath.domain.comparables import parse_csv, parse_json
+
+    try:
+        service = build_comparable_import_service()
+        content = file.read_text()
+        rows = parse_csv(content) if source_format == "csv" else parse_json(content)
+        summary = service.import_rows(
+            item_id, rows, source_format=source_format, actor="human:cli", dry_run=dry_run
+        )
+        _emit_json(summary, json_output=json_output, human=json.dumps(summary, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@comparables_app.command("review-list")
+def comparables_review_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        service = build_review_service()
+        rows = [
+            {"id": str(c.id), "marketplace": c.marketplace.value, "status": c.review_status.value}
+            for c in service.list_comparables_pending()
+        ]
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['marketplace']}  {r['status']}" for r in rows),
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@comparables_app.command("accept")
+def comparables_accept(
+    comparable_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    _comparable_review_cli(comparable_id, "accepted", json_output)
+
+
+@comparables_app.command("reject")
+def comparables_reject(
+    comparable_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    _comparable_review_cli(comparable_id, "rejected", json_output)
+
+
+def _comparable_review_cli(comparable_id: UUID, decision: str, json_output: bool) -> None:
+    from goliath.db.models import ComparableReviewStatus
+
+    try:
+        comparable = build_review_service().review_comparable(
+            comparable_id,
+            reviewer="human:cli",
+            decision=ComparableReviewStatus(decision),
+        )
+        _emit_json(
+            {"id": str(comparable.id), "review_status": comparable.review_status.value},
+            json_output=json_output,
+            human=f"{comparable.id} {comparable.review_status.value}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@review_app.command("list")
+def review_list(
+    status: Annotated[str | None, typer.Option()] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    from goliath.db.models import ReviewTaskStatus
+
+    try:
+        service = build_review_service()
+        tasks = service.list_tasks(status=ReviewTaskStatus(status) if status else None)
+        rows = [
+            {"id": str(t.id), "type": t.task_type.value, "status": t.status.value, "version": t.version}
+            for t in tasks
+        ]
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['type']}  {r['status']}" for r in rows),
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@review_app.command("claim")
+def review_claim(
+    task_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    try:
+        service = build_review_service()
+        task = service.get_task(task_id)
+        claimed = service.claim_task(task_id, reviewer="human:cli", expected_version=task.version)
+        _emit_json(
+            {"id": str(claimed.id), "status": claimed.status.value},
+            json_output=json_output,
+            human=f"{claimed.id} {claimed.status.value}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@review_app.command("complete")
+def review_complete(
+    task_id: UUID,
+    outcome: Annotated[str, typer.Option()] = "resolved",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        task = build_review_service().complete_task(
+            task_id, reviewer="human:cli", outcome=outcome
+        )
+        _emit_json(
+            {"id": str(task.id), "status": task.status.value},
+            json_output=json_output,
+            human=f"{task.id} {task.status.value}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@review_app.command("dismiss")
+def review_dismiss(
+    task_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    try:
+        task = build_review_service().dismiss_task(task_id, reviewer="human:cli")
+        _emit_json(
+            {"id": str(task.id), "status": task.status.value},
+            json_output=json_output,
+            human=f"{task.id} {task.status.value}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@dashboard_app.command("summary")
+def dashboard_summary(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        summary = build_review_service().summary()
+        _emit_json(summary, json_output=json_output, human=json.dumps(summary, indent=2, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+# --------------------------------------------------------------------------- #
+# Milestone six: autonomous marketplace CLI
+# --------------------------------------------------------------------------- #
+
+
+def build_marketplace_service():
+    from goliath.marketplace.service import MarketplaceService
+
+    config = load_config()
+    engine = create_production_engine()
+    return MarketplaceService(session_factory=build_session_factory(engine), config=config)
+
+
+@automation_app.command("status")
+def automation_status(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        status = build_marketplace_service().automation_status()
+        _emit_json(status, json_output=json_output, human=json.dumps(status, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@automation_app.command("stop")
+def automation_stop(
+    reason: Annotated[str, typer.Option()] = "operator requested",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        result = build_marketplace_service().emergency_stop(reason=reason)
+        _emit_json(result, json_output=json_output, human=f"stopped: {reason}")
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@automation_app.command("start")
+def automation_start(
+    reason: Annotated[str, typer.Option()] = "resolved",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        result = build_marketplace_service().emergency_start(reason=reason)
+        _emit_json(result, json_output=json_output, human=f"started: {reason}")
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@marketplace_app.command("account-list")
+def marketplace_account_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        rows = [
+            {"id": str(a.id), "marketplace": a.marketplace.value, "mode": a.automation_mode.value, "status": a.status.value}
+            for a in build_marketplace_service().list_accounts()
+        ]
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['marketplace']}  {r['mode']}  {r['status']}" for r in rows),
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@marketplace_app.command("mode")
+def marketplace_mode(
+    account_id: UUID,
+    mode: str,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        account = build_marketplace_service().set_mode(account_id, mode=mode.replace("-", "_"))
+        _emit_json(
+            {"id": str(account.id), "mode": account.automation_mode.value},
+            json_output=json_output,
+            human=f"{account.id} {account.automation_mode.value}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@marketplace_app.command("authenticate")
+def marketplace_authenticate(
+    account_id: UUID,
+    session_state: Annotated[Path, typer.Option("--session-state")],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Import Playwright storage state through the broker; never print its contents."""
+    try:
+        raw = session_state.expanduser().resolve().read_bytes()
+        build_marketplace_service().authenticate_account(account_id, raw, actor="human:cli")
+        _emit_json(
+            {"authenticated": True, "account_id": str(account_id)},
+            json_output=json_output,
+            human=f"authenticated {account_id}",
+        )
+    except (OSError, RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@marketplace_app.command("sync")
+def marketplace_sync(
+    account_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    try:
+        result = asyncio.run(
+            build_marketplace_service().sync_orders(account_id, principal_scopes={"admin"})
+        )
+        _emit_json(result, json_output=json_output, human=json.dumps(result, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@listing_app.command("publish")
+def listing_publish(
+    draft_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    try:
+        result = asyncio.run(
+            build_marketplace_service().publish_draft(draft_id, principal_scopes={"admin"})
+        )
+        _emit_json(result, json_output=json_output, human=json.dumps(result, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@listing_app.command("refresh")
+def listing_refresh(
+    listing_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    _listing_write(listing_id, "refresh", json_output)
+
+
+@listing_app.command("promote")
+def listing_promote(
+    listing_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    _listing_write(listing_id, "promote", json_output)
+
+
+@listing_app.command("end")
+def listing_end(
+    listing_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    _listing_write(listing_id, "end", json_output)
+
+
+@listing_app.command("sync")
+def listing_sync(
+    listing_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    try:
+        receipt = asyncio.run(
+            build_marketplace_service().read_listing(
+                listing_id, principal_scopes={"admin"}, actor="human:cli"
+            )
+        )
+        result = {"ok": receipt.ok, "data": receipt.data}
+        _emit_json(result, json_output=json_output, human=json.dumps(result, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+def _listing_write(listing_id: UUID, action: str, json_output: bool) -> None:
+    try:
+        service = build_marketplace_service()
+        method = {
+            "refresh": service.refresh_listing,
+            "promote": service.promote_listing,
+            "end": service.end_listing,
+        }[action]
+        receipt = asyncio.run(method(listing_id, principal_scopes={"admin"}))
+        _emit_json(
+            {"ok": receipt.ok, "verified": receipt.verified},
+            json_output=json_output,
+            human=f"{action} ok={receipt.ok}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@order_app.command("list")
+def order_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        rows = [
+            {"id": str(o.id), "status": o.status.value, "sale_price": str(o.sale_price)}
+            for o in build_marketplace_service().list_orders()
+        ]
+        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['status']}" for r in rows))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@order_app.command("sync")
+def order_sync(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        service = build_marketplace_service()
+        results = [
+            asyncio.run(service.sync_orders(a.id, principal_scopes={"admin"}))
+            for a in service.list_accounts()
+        ]
+        _emit_json(results, json_output=json_output, human=json.dumps(results, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@offer_app.command("list")
+def offer_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        rows = [
+            {"id": str(o.id), "status": o.status.value, "amount": str(o.offer_amount)}
+            for o in build_marketplace_service().list_offers()
+        ]
+        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['status']}" for r in rows))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@message_app.command("list")
+def message_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        from goliath.db.marketplace_repositories import MessageRepository
+
+        engine = create_production_engine()
+        with build_session_factory(engine)() as session:
+            rows = [
+                {"id": str(t.id), "escalated": t.escalated, "category": t.last_category}
+                for t in MessageRepository(session).list_threads()
+            ]
+        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['category']}" for r in rows))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@shipping_app.command("list")
+def shipping_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        from goliath.db.marketplace_repositories import ShippingTaskRepository
+
+        engine = create_production_engine()
+        with build_session_factory(engine)() as session:
+            rows = [
+                {"id": str(t.id), "status": t.status.value, "profile": t.package_profile}
+                for t in ShippingTaskRepository(session).list()
+            ]
+        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['status']}" for r in rows))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@shipping_app.command("purchase-label")
+def shipping_purchase_label(
+    task_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    try:
+        result = asyncio.run(
+            build_marketplace_service().purchase_label(task_id, principal_scopes={"admin"})
+        )
+        _emit_json(result, json_output=json_output, human=json.dumps(result, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@reconcile_app.command("run")
+def reconcile_run(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        results = build_marketplace_service().run_reconciliation()
+        _emit_json(results, json_output=json_output, human=json.dumps(results, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@reconcile_app.command("issues")
+def reconcile_issues(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        from goliath.db.marketplace_repositories import ReconciliationRepository
+
+        engine = create_production_engine()
+        with build_session_factory(engine)() as session:
+            rows = [
+                {"id": str(r.id), "order_id": str(r.order_id), "discrepancies": r.discrepancies}
+                for r in ReconciliationRepository(session).list_discrepancies()
+            ]
+        _emit_json(rows, json_output=json_output, human=json.dumps(rows, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@breaker_app.command("list")
+def breaker_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    try:
+        rows = [
+            {"id": str(b.id), "scope": b.scope, "key": b.scope_key, "state": b.state.value}
+            for b in build_marketplace_service().list_breakers()
+        ]
+        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['scope']}  {r['state']}" for r in rows))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@breaker_app.command("reset")
+def breaker_reset(
+    breaker_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    try:
+        breaker = build_marketplace_service().reset_breaker(breaker_id)
+        _emit_json(
+            {"id": str(breaker.id), "state": breaker.state.value},
+            json_output=json_output,
+            human=f"{breaker.id} {breaker.state.value}",
         )
     except (RuntimeError, ValueError, LookupError) as error:
         _fail(error)

@@ -84,7 +84,12 @@ class InventoryMediaRepository:
         original_filename: str | None = None,
         image_width: int | None = None,
         image_height: int | None = None,
+        status: Any = None,
+        detected_media_type: str | None = None,
+        validation_result: dict[str, Any] | None = None,
     ) -> InventoryMedia:
+        from goliath.db.models import MediaStatus
+
         if file_size < 0:
             raise ValueError("file_size must be nonnegative")
         existing = self._session.scalar(
@@ -106,6 +111,9 @@ class InventoryMediaRepository:
             original_filename=original_filename,
             image_width=image_width,
             image_height=image_height,
+            status=status or MediaStatus.PENDING,
+            detected_media_type=detected_media_type,
+            validation_result=validation_result or {},
         )
         self._session.add(media)
         self._session.flush()
@@ -114,12 +122,86 @@ class InventoryMediaRepository:
     def get(self, media_id: UUID) -> InventoryMedia | None:
         return self._session.get(InventoryMedia, media_id)
 
+    def get_by_checksum(self, inventory_item_id: UUID, checksum: str) -> InventoryMedia | None:
+        return self._session.scalar(
+            select(InventoryMedia).where(
+                InventoryMedia.inventory_item_id == inventory_item_id,
+                InventoryMedia.checksum == checksum,
+            )
+        )
+
     def list_for_item(self, inventory_item_id: UUID) -> Sequence[InventoryMedia]:
         return self._session.scalars(
             select(InventoryMedia)
             .where(InventoryMedia.inventory_item_id == inventory_item_id)
             .order_by(InventoryMedia.created_at)
         ).all()
+
+    def list_by_status(self, status: Any, *, limit: int = 100) -> Sequence[InventoryMedia]:
+        return self._session.scalars(
+            select(InventoryMedia)
+            .where(InventoryMedia.status == status)
+            .order_by(InventoryMedia.created_at)
+            .limit(limit)
+        ).all()
+
+    def update_status(
+        self,
+        media_id: UUID,
+        *,
+        expected_version: int,
+        status: Any,
+        detected_media_type: str | None = None,
+        validation_result: dict[str, Any] | None = None,
+        error_category: str | None = None,
+        processing_error: str | None = None,
+        touch: str | None = None,
+    ) -> InventoryMedia:
+        """Optimistic media-state transition using a versioned compare-and-swap."""
+        from goliath.db.models import MediaStatus
+
+        values: dict[str, Any] = {
+            "status": status,
+            "version": expected_version + 1,
+        }
+        if detected_media_type is not None:
+            values["detected_media_type"] = detected_media_type
+        if validation_result is not None:
+            values["validation_result"] = validation_result
+        if error_category is not None:
+            values["processing_error_category"] = error_category
+        if processing_error is not None:
+            values["processing_error"] = processing_error
+        if touch == "validated":
+            values["validated_at"] = utc_now()
+        elif touch == "processing":
+            values["processing_started_at"] = utc_now()
+        elif touch == "processed":
+            values["processing_completed_at"] = utc_now()
+        elif touch == "archived":
+            values["archived_at"] = utc_now()
+        if status is MediaStatus.PROCESSING:
+            values["processing_attempts"] = InventoryMedia.processing_attempts + 1
+        media = self.get(media_id)
+        if media is None:
+            raise RecordNotFoundError(f"media not found: {media_id}")
+        from sqlalchemy import update as _update
+
+        result = self._session.execute(
+            _update(InventoryMedia)
+            .where(
+                InventoryMedia.id == media_id,
+                InventoryMedia.version == expected_version,
+            )
+            .values(**values)
+        )
+        if result.rowcount != 1:
+            self._session.expire_all()
+            raise VersionConflictError(
+                f"stale media version: expected {expected_version} for {media_id}"
+            )
+        self._session.expire(media)
+        return media
 
 
 class MeasurementRepository:
@@ -439,6 +521,9 @@ class PricingRecommendationRepository:
         breakdown: dict[str, Any],
         warnings: list[str],
         inputs: dict[str, Any],
+        policy_version: str | None = None,
+        included_comparables: list[dict[str, Any]] | None = None,
+        excluded_comparables: list[dict[str, Any]] | None = None,
     ) -> PricingRecommendation:
         recommendation = PricingRecommendation(
             inventory_item_id=inventory_item_id,
@@ -455,6 +540,9 @@ class PricingRecommendationRepository:
             breakdown=breakdown,
             warnings=warnings,
             inputs=inputs,
+            policy_version=policy_version,
+            included_comparables=included_comparables or [],
+            excluded_comparables=excluded_comparables or [],
         )
         self._session.add(recommendation)
         self._session.flush()
@@ -873,6 +961,14 @@ class McpPrincipalRepository:
     def create(
         self, *, name: str, scopes: list[str], expires_at: datetime | None = None
     ) -> tuple[McpServicePrincipal, str]:
+        from goliath.core.schemas import HUMAN_ONLY_SCOPES
+
+        forbidden = set(scopes) & HUMAN_ONLY_SCOPES
+        if forbidden:
+            raise ValueError(
+                "MCP service principals may not hold human-only scopes: "
+                + ", ".join(sorted(forbidden))
+            )
         raw = "mcp_" + secrets.token_urlsafe(32)
         principal = McpServicePrincipal(
             name=name,

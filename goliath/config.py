@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+AUTOMATION_MODES = (
+    "disabled",
+    "observe",
+    "shadow",
+    "autonomous_conservative",
+    "autonomous_normal",
+    "paused",
+)
+AutomationModeLiteral = Literal[
+    "disabled",
+    "observe",
+    "shadow",
+    "autonomous_conservative",
+    "autonomous_normal",
+    "paused",
+]
 
 from goliath.core.schemas import AgentPermission, CapabilityName, TaskType
 
@@ -121,6 +139,96 @@ class CompletenessRuleConfig(BaseModel):
     required_measurements: list[str] = Field(default_factory=list)
 
 
+class MediaConfig(BaseModel):
+    """Milestone-five media ingestion and image-processing configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    media_root: Path = Field(default=Path("/srv/resale-goliath/media"))
+    quarantine_root: Path = Field(default=Path("/srv/resale-goliath/quarantine"))
+    temp_upload_root: Path = Field(default=Path("/srv/resale-goliath/tmp"))
+    allowed_mime_types: set[str] = Field(
+        default_factory=lambda: {"image/jpeg", "image/png", "image/webp"}
+    )
+    allowed_extensions: set[str] = Field(
+        default_factory=lambda: {".jpg", ".jpeg", ".png", ".webp"}
+    )
+    max_file_bytes: int = Field(default=25_000_000, ge=1, le=1_000_000_000)
+    max_image_dimension: int = Field(default=12_000, ge=16, le=100_000)
+    min_image_dimension: int = Field(default=200, ge=1, le=100_000)
+    thumbnail_dimension: int = Field(default=256, ge=16, le=4_096)
+    preview_dimension: int = Field(default=1024, ge=32, le=8_192)
+    jpeg_quality: int = Field(default=85, ge=1, le=100)
+    pad_square_canvas: bool = False
+    processing_max_attempts: int = Field(default=3, ge=1, le=20)
+    processing_backoff_seconds: float = Field(default=5.0, ge=0, le=3_600)
+    blur_variance_threshold: float = Field(default=50.0, ge=0, le=100_000)
+    max_aspect_ratio: float = Field(default=4.0, gt=1, le=100)
+
+    @model_validator(mode="after")
+    def roots_are_distinct(self) -> MediaConfig:
+        roots = {
+            "media_root": self.media_root.expanduser().resolve(),
+            "quarantine_root": self.quarantine_root.expanduser().resolve(),
+            "temp_upload_root": self.temp_upload_root.expanduser().resolve(),
+        }
+        resolved = list(roots.values())
+        if len(set(resolved)) != len(resolved):
+            raise ValueError("media, quarantine, and temp roots must be distinct")
+        # Reject nesting one storage root inside another (unsafe overlap).
+        for name_a, path_a in roots.items():
+            for name_b, path_b in roots.items():
+                if name_a != name_b and path_a.is_relative_to(path_b):
+                    raise ValueError(
+                        f"{name_a} must not be nested inside {name_b}"
+                    )
+        if self.min_image_dimension >= self.max_image_dimension:
+            raise ValueError("min_image_dimension must be below max_image_dimension")
+        return self
+
+
+class AnalysisProviderConfig(BaseModel):
+    """Optional image-analysis provider; disabled by default, no vendor hard-coded."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    provider: str = "fake"
+    min_confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ComparableImportConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_rows: int = Field(default=1_000, ge=1, le=100_000)
+    allowed_currencies: set[str] = Field(default_factory=lambda: {"USD", "EUR", "GBP", "CAD"})
+
+
+class PricingSourcePolicy(BaseModel):
+    """Configurable, versioned policy governing which comparables feed pricing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = "policy-v1"
+    reviewed_only: bool = True
+    min_comparable_count: int = Field(default=1, ge=0, le=1_000)
+    max_comparable_age_days: int = Field(default=180, ge=1, le=3_650)
+    sold_weight: float = Field(default=0.7, ge=0, le=1)
+    active_weight: float = Field(default=0.3, ge=0, le=1)
+    reliability_threshold: float = Field(default=0.3, ge=0, le=1)
+    similarity_threshold: float = Field(default=0.3, ge=0, le=1)
+    outlier_z_threshold: float = Field(default=3.0, gt=0, le=10)
+    allowed_currencies: set[str] = Field(default_factory=lambda: {"USD"})
+    marketplace_weighting: dict[str, float] = Field(default_factory=dict)
+    fallback_to_cost_plus: bool = True
+
+    @model_validator(mode="after")
+    def weights_positive(self) -> PricingSourcePolicy:
+        if self.sold_weight + self.active_weight <= 0:
+            raise ValueError("comparable weights must sum to a positive value")
+        return self
+
+
 class DomainConfig(BaseModel):
     """Typed configuration for milestone-four resale-domain behavior."""
 
@@ -191,6 +299,7 @@ class DomainConfig(BaseModel):
     )
     mcp_host: str = "127.0.0.1"
     mcp_transport: Literal["stdio", "http"] = "stdio"
+    mcp_http_port: int = Field(default=8900, ge=1, le=65_535)
     mcp_authentication_required: bool = True
     mcp_allow_unauthenticated_non_loopback: bool = False
     mcp_scopes: set[str] = Field(
@@ -204,8 +313,20 @@ class DomainConfig(BaseModel):
             "listing:write_draft",
             "approval:read",
             "approval:request",
+            "media:read",
+            "media:write",
+            "comparables:read",
+            "comparables:write",
         }
     )
+    # Milestone five.
+    media: MediaConfig = Field(default_factory=MediaConfig)
+    analysis_provider: AnalysisProviderConfig = Field(default_factory=AnalysisProviderConfig)
+    comparable_import: ComparableImportConfig = Field(default_factory=ComparableImportConfig)
+    pricing_source_policy: PricingSourcePolicy = Field(default_factory=PricingSourcePolicy)
+    review_task_expiration_seconds: int = Field(default=1_209_600, ge=60, le=31_536_000)
+    dashboard_max_page_size: int = Field(default=200, ge=1, le=1_000)
+    bulk_operation_max_items: int = Field(default=200, ge=1, le=5_000)
 
     @model_validator(mode="after")
     def fee_version_exists(self) -> DomainConfig:
@@ -224,7 +345,17 @@ class DomainConfig(BaseModel):
             raise ValueError(
                 "unauthenticated non-loopback MCP exposure requires an explicit override"
             )
+        # Keep media_storage_root aligned with the media root by default.
+        if self.media.media_root != Path("/srv/resale-goliath/media"):
+            self.media_storage_root = self.media.media_root
         return self
+
+    def resolve_quarantine_path(self, candidate: Path) -> Path:
+        root = self.media.quarantine_root.expanduser().resolve()
+        resolved = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError(f"quarantine path is outside the configured root: {candidate}")
+        return resolved
 
     def resolve_media_path(self, candidate: Path) -> Path:
         """Reject media paths that escape the configured storage root."""
@@ -233,6 +364,270 @@ class DomainConfig(BaseModel):
         if not resolved.is_relative_to(root):
             raise ValueError(f"media path is outside the configured root: {candidate}")
         return resolved
+
+
+class SessionEncryptionConfig(BaseModel):
+    """Session-state-at-rest settings. Persistent sessions must be encrypted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_root: Path = Field(default=Path("data/sessions"))
+    require_encryption: bool = True
+    encryption_key: str | None = None
+    session_ttl_seconds: int = Field(default=1_209_600, ge=60, le=31_536_000)
+    browser_executable: str | None = None
+
+    @model_validator(mode="after")
+    def encryption_is_required(self) -> SessionEncryptionConfig:
+        if not self.require_encryption:
+            raise ValueError("persistent marketplace sessions must be encrypted at rest")
+        return self
+
+
+class PublishingRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_expected_profit: Decimal = Field(default=Decimal("5.00"), ge=0)
+    require_images: bool = True
+    min_images: int = Field(default=1, ge=0, le=50)
+    max_active_listings_per_item: int = Field(default=6, ge=1, le=50)
+
+
+class CrossListingRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: Literal["single", "preferred", "all_eligible", "category"] = "preferred"
+    preferred_marketplaces: list[str] = Field(default_factory=lambda: ["ebay", "poshmark"])
+    category_marketplaces: dict[str, list[str]] = Field(default_factory=dict)
+    max_active_listings: int = Field(default=4, ge=1, le=20)
+    delayed_secondary_seconds: int = Field(default=0, ge=0, le=604_800)
+
+
+class OfferRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_net_profit: Decimal = Field(default=Decimal("12.00"), ge=0)
+    minimum_margin_percent: float = Field(default=20.0, ge=0, le=100)
+    maximum_discount_percent: float = Field(default=35.0, ge=0, le=100)
+    automatic_accept: bool = True
+    automatic_counter: bool = True
+    automatic_decline: bool = True
+    counter_increment: Decimal = Field(default=Decimal("1.00"), ge=0)
+    cooldown_minutes: int = Field(default=60, ge=0, le=100_000)
+
+
+class MessagingRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_categories: list[str] = Field(
+        default_factory=lambda: [
+            "availability",
+            "measurements",
+            "condition_details",
+            "included_accessories",
+            "shipping_timing",
+            "tracking_status",
+            "bundle_requests",
+            "price_questions",
+            "offer_explanations",
+            "thank_you",
+            "cancellation_ack",
+        ]
+    )
+    escalation_categories: list[str] = Field(
+        default_factory=lambda: [
+            "threat",
+            "harassment",
+            "legal_claim",
+            "counterfeit_allegation",
+            "chargeback",
+            "fraud",
+            "off_platform_payment",
+            "personal_contact_request",
+            "tracking_dispute",
+            "unusual_refund_demand",
+        ]
+    )
+
+    @model_validator(mode="after")
+    def categories_present(self) -> MessagingRules:
+        if not self.allowed_categories:
+            raise ValueError("buyer messaging requires at least one allowed category")
+        return self
+
+
+class PricingAutomationRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_net_profit: Decimal = Field(default=Decimal("12.00"), ge=0)
+    maximum_daily_reduction_percent: float = Field(default=10.0, gt=0, le=100)
+    maximum_total_reduction_percent: float = Field(default=40.0, gt=0, le=100)
+    cooldown_hours: int = Field(default=24, ge=0, le=10_000)
+    marketplace_rounding: Decimal = Field(default=Decimal("1.00"), gt=0)
+    stale_thresholds: dict[int, float] = Field(
+        default_factory=lambda: {14: 5.0, 30: 8.0, 60: 12.0, 90: 15.0}
+    )
+
+
+class RelistingRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    stale_after_days: int = Field(default=90, ge=1, le=3650)
+    cooldown_hours: int = Field(default=24, ge=1, le=8760)
+    maximum_relists: int = Field(default=3, ge=0, le=100)
+
+
+class ShippingRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    automatic_label_purchase: bool = True
+    maximum_label_cost: Decimal = Field(default=Decimal("18.00"), ge=0)
+    require_confirmed_weight_above: float = Field(default=5.0, ge=0)
+    default_package_profile: str = "polymailer-medium"
+
+    @model_validator(mode="after")
+    def label_ceiling_present(self) -> ShippingRules:
+        if self.automatic_label_purchase and self.maximum_label_cost <= 0:
+            raise ValueError("automatic label purchase requires a positive cost ceiling")
+        return self
+
+
+class RefundRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    automatic_limit: Decimal = Field(default=Decimal("30.00"), ge=0)
+    allowed_reasons: list[str] = Field(
+        default_factory=lambda: [
+            "order_cancelled_before_shipping",
+            "verified_inventory_error",
+            "duplicate_sale",
+        ]
+    )
+    require_exception_review_above: Decimal = Field(default=Decimal("30.00"), ge=0)
+
+    @model_validator(mode="after")
+    def ceiling_present(self) -> RefundRules:
+        if self.enabled and self.automatic_limit <= 0:
+            raise ValueError("automatic refunds require a positive amount ceiling")
+        return self
+
+
+class CircuitBreakerRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    failure_threshold: int = Field(default=5, ge=1, le=1000)
+    cooldown_seconds: int = Field(default=300, ge=1, le=86_400)
+    half_open_probe_after_seconds: int = Field(default=300, ge=1, le=86_400)
+
+
+class MarketplaceAccountConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    marketplace: str
+    label: str
+    automation_mode: AutomationModeLiteral = "disabled"
+    currency: str = "USD"
+    capabilities: set[str] = Field(default_factory=set)
+    allowed_domains: list[str] = Field(default_factory=list)
+    operation_modes: dict[str, AutomationModeLiteral] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def domains_present(self) -> MarketplaceAccountConfig:
+        from goliath.marketplace.adapter import MARKETPLACE_OPERATIONS
+
+        unknown = (set(self.capabilities) | set(self.operation_modes)) - set(
+            MARKETPLACE_OPERATIONS
+        )
+        if unknown:
+            raise ValueError(f"unsupported marketplace operations: {', '.join(sorted(unknown))}")
+        if not self.allowed_domains:
+            raise ValueError(f"marketplace account {self.label} requires an allowed-domain list")
+        expected_domains = {
+            "ebay": ("ebay.com",),
+            "poshmark": ("poshmark.com",),
+            "depop": ("depop.com",),
+            "mercari": ("mercari.com",),
+            "grailed": ("grailed.com",),
+            "facebook": ("facebook.com",),
+        }.get(self.marketplace, ())
+        for domain in self.allowed_domains:
+            normalized = domain.strip().lower().rstrip(".")
+            if "://" in normalized or "/" in normalized or not normalized:
+                raise ValueError(f"invalid marketplace domain allowlist entry: {domain}")
+            if expected_domains and not any(
+                normalized == expected or normalized.endswith("." + expected)
+                for expected in expected_domains
+            ):
+                raise ValueError(
+                    f"domain {domain} is outside the {self.marketplace} allowlist"
+                )
+        return self
+
+
+class MarketplaceAutomationConfig(BaseModel):
+    """Typed configuration for milestone-six autonomous marketplace operations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_mode: AutomationModeLiteral = "disabled"
+    operation_modes: dict[str, AutomationModeLiteral] = Field(default_factory=dict)
+    session: SessionEncryptionConfig = Field(default_factory=SessionEncryptionConfig)
+    accounts: dict[str, MarketplaceAccountConfig] = Field(default_factory=dict)
+    publishing: PublishingRules = Field(default_factory=PublishingRules)
+    cross_listing: CrossListingRules = Field(default_factory=CrossListingRules)
+    pricing: PricingAutomationRules = Field(default_factory=PricingAutomationRules)
+    relisting: RelistingRules = Field(default_factory=RelistingRules)
+    offers: OfferRules = Field(default_factory=OfferRules)
+    messaging: MessagingRules = Field(default_factory=MessagingRules)
+    shipping: ShippingRules = Field(default_factory=ShippingRules)
+    refunds: RefundRules = Field(default_factory=RefundRules)
+    circuit_breaker: CircuitBreakerRules = Field(default_factory=CircuitBreakerRules)
+    operation_rate_limit_per_minute: int = Field(default=60, ge=1, le=100_000)
+    max_publish_per_hour: int = Field(default=100, ge=1, le=100_000)
+    max_delisting_latency_seconds: int = Field(default=900, ge=1, le=86_400)
+    reservation_ttl_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
+    max_operation_retries: int = Field(default=5, ge=1, le=100)
+    high_value_threshold: Decimal = Field(default=Decimal("500.00"), ge=0)
+    conservative_profit_multiplier: Decimal = Field(default=Decimal("1.50"), ge=1, le=10)
+    marketplace_scopes: set[str] = Field(
+        default_factory=lambda: {
+            "marketplace:read",
+            "marketplace:listing:create",
+            "marketplace:listing:update",
+            "marketplace:listing:refresh",
+            "marketplace:listing:end",
+            "marketplace:listing:promote",
+            "marketplace:listing:share",
+            "marketplace:offer:read",
+            "marketplace:offer:respond",
+            "marketplace:message:read",
+            "marketplace:message:routine",
+            "marketplace:order:read",
+            "marketplace:tracking:update",
+            "marketplace:label:purchase",
+            "marketplace:sync",
+        }
+    )
+
+    @model_validator(mode="after")
+    def autonomous_requires_profit_rules(self) -> MarketplaceAutomationConfig:
+        from goliath.marketplace.adapter import MARKETPLACE_OPERATIONS
+
+        unknown = set(self.operation_modes) - set(MARKETPLACE_OPERATIONS)
+        if unknown:
+            raise ValueError(f"unsupported marketplace operations: {', '.join(sorted(unknown))}")
+        autonomous = {"autonomous_conservative", "autonomous_normal"}
+        modes = {self.default_mode} | {a.automation_mode for a in self.accounts.values()}
+        if modes & autonomous:
+            if self.publishing.minimum_expected_profit <= 0:
+                raise ValueError("autonomous mode requires a positive minimum expected profit")
+            if self.offers.minimum_net_profit <= 0 or self.pricing.minimum_net_profit <= 0:
+                raise ValueError("autonomous mode requires minimum-profit rules")
+            if not self.session.encryption_key and not os.environ.get("GOLIATH_SESSION_KEY"):
+                raise ValueError("autonomous mode requires a persistent session encryption key")
+        return self
 
 
 class OrchestrationConfig(BaseModel):
@@ -269,6 +664,9 @@ class OrchestrationConfig(BaseModel):
     workspace_roots: list[Path] = Field(min_length=1)
     agents: dict[str, AgentConfig] = Field(default_factory=dict)
     domain: DomainConfig = Field(default_factory=DomainConfig)
+    marketplace: MarketplaceAutomationConfig = Field(
+        default_factory=MarketplaceAutomationConfig
+    )
 
     @field_validator("workspace_roots")
     @classmethod
@@ -295,6 +693,20 @@ class OrchestrationConfig(BaseModel):
             raise ValueError("unauthenticated non-loopback API binding requires explicit override")
         if self.metrics_public and not self.metrics_enabled:
             raise ValueError("public metrics require metrics_enabled")
+        # Marketplace session state must never live inside an agent workspace.
+        session_root = self.marketplace.session.session_root.expanduser().resolve()
+        for root in self.workspace_roots:
+            if session_root == root or session_root.is_relative_to(root):
+                raise ValueError(
+                    "marketplace session root must be outside all agent workspaces"
+                )
+        # General coding agents must not inherit marketplace scopes.
+        marketplace_scopes = self.marketplace.marketplace_scopes
+        for name, agent in self.agents.items():
+            if agent.adapter == "codex" and set(agent.mcp_scopes) & marketplace_scopes:
+                raise ValueError(
+                    f"coding agent '{name}' must not hold marketplace scopes"
+                )
         return self
 
     def validate_workspace(self, workspace: Path) -> Path:

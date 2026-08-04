@@ -149,6 +149,66 @@ class ProposalStatus(StrEnum):
     EXECUTION_FAILED = "execution_failed"
 
 
+class MediaStatus(StrEnum):
+    PENDING = "pending"
+    VALIDATED = "validated"
+    QUARANTINED = "quarantined"
+    PROCESSING = "processing"
+    PROCESSED = "processed"
+    FAILED = "failed"
+    ARCHIVED = "archived"
+
+
+class MediaJobStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class ComparableProviderType(StrEnum):
+    IMPORTED_CSV = "imported_csv"
+    MANUAL = "manual"
+    BROWSER_AGENT = "browser_agent"
+    MARKETPLACE_API = "marketplace_api"
+    DATA_PROVIDER = "data_provider"
+
+
+class ComparableReviewStatus(StrEnum):
+    PENDING_REVIEW = "pending_review"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    DUPLICATE = "duplicate"
+    INVALIDATED = "invalidated"
+
+
+class ReviewTaskType(StrEnum):
+    INVENTORY_COMPLETION = "inventory_completion"
+    MEDIA_VALIDATION = "media_validation"
+    IMAGE_QUALITY = "image_quality"
+    RESEARCH_RESOLUTION = "research_resolution"
+    COMPARABLE_REVIEW = "comparable_review"
+    PRICING_REVIEW = "pricing_review"
+    LISTING_REVIEW = "listing_review"
+    PROPOSAL_REVIEW = "proposal_review"
+
+
+class ReviewTaskStatus(StrEnum):
+    OPEN = "open"
+    CLAIMED = "claimed"
+    COMPLETED = "completed"
+    DISMISSED = "dismissed"
+    EXPIRED = "expired"
+
+
+class ImportStatus(StrEnum):
+    PENDING = "pending"
+    DRY_RUN = "dry_run"
+    COMPLETED = "completed"
+    ROLLED_BACK = "rolled_back"
+    FAILED = "failed"
+
+
 class ListingStatus(StrEnum):
     DRAFT = "draft"
     PENDING_APPROVAL = "pending_approval"
@@ -554,6 +614,21 @@ class InventoryMedia(Base):
         default=MediaProcessingStatus.PENDING,
     )
     processing_error: Mapped[str | None] = mapped_column(Text)
+    # Milestone five: media lifecycle.
+    status: Mapped[MediaStatus] = mapped_column(
+        enum_type(MediaStatus, "media_status"),
+        nullable=False,
+        default=MediaStatus.PENDING,
+    )
+    detected_media_type: Mapped[str | None] = mapped_column(String(100))
+    validation_result: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    processing_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    processing_error_category: Mapped[str | None] = mapped_column(String(100))
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
@@ -715,6 +790,21 @@ class ComparableSale(Base):
     notes: Mapped[str | None] = mapped_column(Text)
     invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     invalidation_reason: Mapped[str | None] = mapped_column(Text)
+    # Milestone five: provider metadata and review lifecycle.
+    provider_type: Mapped[ComparableProviderType] = mapped_column(
+        enum_type(ComparableProviderType, "comparable_provider_type"),
+        nullable=False,
+        default=ComparableProviderType.MANUAL,
+    )
+    provider_identity: Mapped[str | None] = mapped_column(String(200))
+    review_status: Mapped[ComparableReviewStatus] = mapped_column(
+        enum_type(ComparableReviewStatus, "comparable_review_status"),
+        nullable=False,
+        default=ComparableReviewStatus.PENDING_REVIEW,
+    )
+    reviewed_by: Mapped[str | None] = mapped_column(String(200))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    import_id: Mapped[UUID | None] = mapped_column(Uuid)
     captured_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
@@ -740,6 +830,14 @@ class PricingRecommendation(Base):
     breakdown: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     warnings: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     inputs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    # Milestone five: pricing-source policy transparency.
+    policy_version: Mapped[str | None] = mapped_column(String(50))
+    included_comparables: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    excluded_comparables: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
     created_by: Mapped[str] = mapped_column(String(200), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
@@ -952,3 +1050,924 @@ class McpServicePrincipal(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# --------------------------------------------------------------------------- #
+# Milestone five: media processing, comparable ingestion, review tasks
+# --------------------------------------------------------------------------- #
+
+
+class MediaDerivation(Base):
+    """Parent-child derivation record for a generated image artifact."""
+
+    __tablename__ = "media_derivations"
+    __table_args__ = (
+        UniqueConstraint("parent_media_id", "operation", name="derivation_operation"),
+        Index("ix_media_derivations_parent", "parent_media_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    parent_media_id: Mapped[UUID] = mapped_column(
+        ForeignKey("inventory_media.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    operation: Mapped[str] = mapped_column(String(100), nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(1000), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    checksum: Mapped[str] = mapped_column(String(128), nullable=False)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    file_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class MediaProcessingJob(Base):
+    """Durable, leased image-processing job with retries and backoff."""
+
+    __tablename__ = "media_processing_jobs"
+    __table_args__ = (
+        CheckConstraint("attempts >= 0", name="attempts_nonnegative"),
+        CheckConstraint("version > 0", name="version_positive"),
+        Index("ix_media_processing_jobs_status", "status", "next_eligible_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    media_id: Mapped[UUID] = mapped_column(
+        ForeignKey("inventory_media.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    job_type: Mapped[str] = mapped_column(String(50), nullable=False, default="image_processing")
+    status: Mapped[MediaJobStatus] = mapped_column(
+        enum_type(MediaJobStatus, "media_job_status"),
+        nullable=False,
+        default=MediaJobStatus.QUEUED,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    error_category: Mapped[str | None] = mapped_column(String(100))
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+    locked_by: Mapped[str | None] = mapped_column(String(200))
+    lease_token_hash: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MediaProcessingAttempt(Base):
+    __tablename__ = "media_processing_attempts"
+    __table_args__ = (
+        UniqueConstraint("job_id", "attempt_number", name="media_attempt_number"),
+        Index("ix_media_processing_attempts_job", "job_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("media_processing_jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    worker_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False)
+    error_category: Mapped[str | None] = mapped_column(String(100))
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ImageQualityResult(Base):
+    __tablename__ = "image_quality_results"
+    __table_args__ = (Index("ix_image_quality_results_media", "media_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    media_id: Mapped[UUID] = mapped_column(
+        ForeignKey("inventory_media.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    findings: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    blur_variance: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    aspect_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 3))
+    color_mode: Mapped[str | None] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class PerceptualHash(Base):
+    __tablename__ = "perceptual_hashes"
+    __table_args__ = (
+        UniqueConstraint("media_id", "algorithm", name="perceptual_media_algorithm"),
+        Index("ix_perceptual_hashes_value", "algorithm", "hash_hex"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    media_id: Mapped[UUID] = mapped_column(
+        ForeignKey("inventory_media.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    algorithm: Mapped[str] = mapped_column(String(20), nullable=False, default="ahash")
+    hash_hex: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ComparableImport(Base):
+    __tablename__ = "comparable_imports"
+    __table_args__ = (Index("ix_comparable_imports_item", "inventory_item_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    inventory_item_id: Mapped[UUID] = mapped_column(
+        ForeignKey("inventory_items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_format: Mapped[str] = mapped_column(String(20), nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    status: Mapped[ImportStatus] = mapped_column(
+        enum_type(ImportStatus, "import_status"), nullable=False, default=ImportStatus.PENDING
+    )
+    total_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    imported_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duplicate_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ComparableImportRow(Base):
+    __tablename__ = "comparable_import_rows"
+    __table_args__ = (Index("ix_comparable_import_rows_import", "import_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    import_id: Mapped[UUID] = mapped_column(
+        ForeignKey("comparable_imports.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    row_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+    comparable_id: Mapped[UUID | None] = mapped_column(Uuid)
+
+
+class ComparableReviewDecision(Base):
+    __tablename__ = "comparable_review_decisions"
+    __table_args__ = (Index("ix_comparable_review_decisions_comparable", "comparable_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    comparable_id: Mapped[UUID] = mapped_column(
+        ForeignKey("comparable_sales.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reviewer: Mapped[str] = mapped_column(String(200), nullable=False)
+    decision: Mapped[ComparableReviewStatus] = mapped_column(
+        enum_type(ComparableReviewStatus, "review_decision_status"), nullable=False
+    )
+    similarity_score: Mapped[Decimal | None] = mapped_column(Numeric(4, 3))
+    reliability_score: Mapped[Decimal | None] = mapped_column(Numeric(4, 3))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class PricingSourcePolicyRecord(Base):
+    __tablename__ = "pricing_source_policies"
+    __table_args__ = (UniqueConstraint("name", "version", name="policy_name_version"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, default="default")
+    version: Mapped[str] = mapped_column(String(50), nullable=False)
+    reviewed_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ReviewTask(Base):
+    __tablename__ = "review_tasks"
+    __table_args__ = (
+        CheckConstraint("version > 0", name="version_positive"),
+        UniqueConstraint("dedupe_key", name="review_task_dedupe"),
+        Index("ix_review_tasks_status_type", "status", "task_type"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    task_type: Mapped[ReviewTaskType] = mapped_column(
+        enum_type(ReviewTaskType, "review_task_type"), nullable=False
+    )
+    resource_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    resource_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(300), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[ReviewTaskStatus] = mapped_column(
+        enum_type(ReviewTaskStatus, "review_task_status"),
+        nullable=False,
+        default=ReviewTaskStatus.OPEN,
+    )
+    assigned_reviewer: Mapped[str | None] = mapped_column(String(200))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    outcome: Mapped[str | None] = mapped_column(String(100))
+    notes: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ReviewTaskEvent(Base):
+    __tablename__ = "review_task_events"
+    __table_args__ = (Index("ix_review_task_events_task", "task_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("review_tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    actor: Mapped[str] = mapped_column(String(200), nullable=False)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Milestone six: autonomous marketplace operations
+# --------------------------------------------------------------------------- #
+
+
+class AutomationMode(StrEnum):
+    DISABLED = "disabled"
+    OBSERVE = "observe"
+    SHADOW = "shadow"
+    AUTONOMOUS_CONSERVATIVE = "autonomous_conservative"
+    AUTONOMOUS_NORMAL = "autonomous_normal"
+    PAUSED = "paused"
+
+
+# Modes that permit real marketplace writes.
+AUTONOMOUS_WRITE_MODES: frozenset[AutomationMode] = frozenset(
+    {AutomationMode.AUTONOMOUS_CONSERVATIVE, AutomationMode.AUTONOMOUS_NORMAL}
+)
+
+
+class MarketplaceAccountStatus(StrEnum):
+    DISCONNECTED = "disconnected"
+    AUTHENTICATION_REQUIRED = "authentication_required"
+    CONNECTING = "connecting"
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    RATE_LIMITED = "rate_limited"
+    CHALLENGED = "challenged"
+    SUSPENDED = "suspended"
+    DISABLED = "disabled"
+
+
+# Account statuses that forbid marketplace writes.
+WRITE_FORBIDDEN_ACCOUNT_STATUSES: frozenset[MarketplaceAccountStatus] = frozenset(
+    {
+        MarketplaceAccountStatus.CHALLENGED,
+        MarketplaceAccountStatus.SUSPENDED,
+        MarketplaceAccountStatus.DISABLED,
+        MarketplaceAccountStatus.AUTHENTICATION_REQUIRED,
+    }
+)
+
+
+class RemoteListingStatus(StrEnum):
+    PENDING_PUBLISH = "pending_publish"
+    PUBLISHING = "publishing"
+    ACTIVE = "active"
+    RESERVED = "reserved"
+    SOLD = "sold"
+    ENDING = "ending"
+    ENDED = "ended"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class SyncState(StrEnum):
+    CLEAN = "clean"
+    LOCAL_CHANGE_PENDING = "local_change_pending"
+    REMOTE_CHANGE_DETECTED = "remote_change_detected"
+    CONFLICT = "conflict"
+    SYNC_FAILED = "sync_failed"
+
+
+class OrderStatus(StrEnum):
+    PENDING_PAYMENT = "pending_payment"
+    PAID = "paid"
+    READY_TO_SHIP = "ready_to_ship"
+    SHIPPED = "shipped"
+    DELIVERED = "delivered"
+    CANCELLED = "cancelled"
+    PARTIALLY_REFUNDED = "partially_refunded"
+    REFUNDED = "refunded"
+    DISPUTED = "disputed"
+    UNKNOWN = "unknown"
+
+
+class OfferDecision(StrEnum):
+    ACCEPT = "accept"
+    DECLINE = "decline"
+    COUNTER = "counter"
+    SEND_OFFER = "send_offer"
+    DEFER = "defer"
+    ESCALATE = "escalate"
+
+
+class OfferStatus(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+    COUNTERED = "countered"
+    EXPIRED = "expired"
+    ESCALATED = "escalated"
+
+
+class ReservationReason(StrEnum):
+    PENDING_PAYMENT = "pending_payment"
+    PAID_SALE = "paid_sale"
+    ACTIVE_CHECKOUT = "active_checkout"
+    ACCEPTED_OFFER = "accepted_offer"
+    BUNDLE_NEGOTIATION = "bundle_negotiation"
+    MARKETPLACE_HOLD = "marketplace_hold"
+    SUSPECTED_DUPLICATE_SALE = "suspected_duplicate_sale"
+    MANUAL_HOLD = "manual_hold"
+
+
+class ShippingTaskStatus(StrEnum):
+    PENDING = "pending"
+    READY = "ready"
+    LABEL_PURCHASED = "label_purchased"
+    PACKED = "packed"
+    SHIPPED = "shipped"
+    CONFIRMED = "confirmed"
+    OVERDUE = "overdue"
+    CANCELLED = "cancelled"
+
+
+class CircuitBreakerState(StrEnum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class ExceptionStatus(StrEnum):
+    OPEN = "open"
+    ACKNOWLEDGED = "acknowledged"
+    RESOLVED = "resolved"
+    DISMISSED = "dismissed"
+
+
+class ReconciliationStatus(StrEnum):
+    PRELIMINARY = "preliminary"
+    FINAL = "final"
+    DISCREPANCY = "discrepancy"
+    RESOLVED = "resolved"
+
+
+class OperationStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    VERIFIED = "verified"
+    VERIFICATION_FAILED = "verification_failed"
+    SHADOWED = "shadowed"
+
+
+class MarketplaceAccount(Base):
+    __tablename__ = "marketplace_accounts"
+    __table_args__ = (
+        CheckConstraint("version > 0", name="version_positive"),
+        CheckConstraint("consecutive_failures >= 0", name="failures_nonnegative"),
+        UniqueConstraint("marketplace", "account_label", name="account_marketplace_label"),
+        Index("ix_marketplace_accounts_status", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    marketplace: Mapped[Marketplace] = mapped_column(
+        enum_type(Marketplace, "account_marketplace"), nullable=False
+    )
+    account_label: Mapped[str] = mapped_column(String(100), nullable=False)
+    seller_region: Mapped[str | None] = mapped_column(String(50))
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    automation_mode: Mapped[AutomationMode] = mapped_column(
+        enum_type(AutomationMode, "account_automation_mode"),
+        nullable=False,
+        default=AutomationMode.DISABLED,
+    )
+    status: Mapped[MarketplaceAccountStatus] = mapped_column(
+        enum_type(MarketplaceAccountStatus, "marketplace_account_status"),
+        nullable=False,
+        default=MarketplaceAccountStatus.DISCONNECTED,
+    )
+    capabilities: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    session_reference: Mapped[str | None] = mapped_column(String(200))
+    session_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_authenticated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failed_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rate_limit_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    health_state: Mapped[str] = mapped_column(String(50), nullable=False, default="unknown")
+    mode_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+class SessionReference(Base):
+    """Encrypted session state at rest. Ciphertext only; never raw cookies."""
+
+    __tablename__ = "session_references"
+    __table_args__ = (
+        UniqueConstraint("reference_key", name="session_reference_key"),
+        Index("ix_session_references_account", "account_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reference_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    key_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    storage_dir: Mapped[str] = mapped_column(String(1000), nullable=False)
+    allowed_domains: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_auth_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class RemoteListing(Base):
+    __tablename__ = "remote_listings"
+    __table_args__ = (
+        CheckConstraint("local_version > 0", name="local_version_positive"),
+        UniqueConstraint("account_id", "remote_listing_id", name="remote_listing_identity"),
+        Index("ix_remote_listings_item", "inventory_item_id"),
+        Index("ix_remote_listings_status", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    inventory_item_id: Mapped[UUID] = mapped_column(
+        ForeignKey("inventory_items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    remote_listing_id: Mapped[str | None] = mapped_column(String(200))
+    remote_url: Mapped[str | None] = mapped_column(String(2000))
+    marketplace_category: Mapped[str | None] = mapped_column(String(200))
+    draft_version: Mapped[int | None] = mapped_column(Integer)
+    variant_version: Mapped[str | None] = mapped_column(String(50))
+    current_title: Mapped[str | None] = mapped_column(String(500))
+    description_checksum: Mapped[str | None] = mapped_column(String(128))
+    current_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[RemoteListingStatus] = mapped_column(
+        enum_type(RemoteListingStatus, "remote_listing_status"),
+        nullable=False,
+        default=RemoteListingStatus.PENDING_PUBLISH,
+    )
+    sync_state: Mapped[SyncState] = mapped_column(
+        enum_type(SyncState, "remote_listing_sync_state"),
+        nullable=False,
+        default=SyncState.CLEAN,
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    remote_revision: Mapped[str | None] = mapped_column(String(100))
+    last_verified_action: Mapped[str | None] = mapped_column(String(100))
+    last_error_category: Mapped[str | None] = mapped_column(String(100))
+    automation_mode_used: Mapped[str | None] = mapped_column(String(50))
+    originating_job_id: Mapped[UUID | None] = mapped_column(Uuid)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
+    relist_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    local_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class MarketplaceOperationAttempt(Base):
+    __tablename__ = "marketplace_operation_attempts"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="operation_idempotency_key"),
+        Index("ix_operation_attempts_account", "account_id", "operation"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    operation: Mapped[str] = mapped_column(String(80), nullable=False)
+    resource_type: Mapped[str | None] = mapped_column(String(80))
+    resource_id: Mapped[UUID | None] = mapped_column(Uuid)
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[OperationStatus] = mapped_column(
+        enum_type(OperationStatus, "operation_status"),
+        nullable=False,
+        default=OperationStatus.PENDING,
+    )
+    automation_mode: Mapped[str] = mapped_column(String(50), nullable=False)
+    request_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    result_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    remote_identifier: Mapped[str | None] = mapped_column(String(200))
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error_category: Mapped[str | None] = mapped_column(String(100))
+    agent_identity: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MarketplaceOrder(Base):
+    __tablename__ = "marketplace_orders"
+    __table_args__ = (
+        UniqueConstraint("account_id", "remote_order_id", name="order_identity"),
+        Index("ix_marketplace_orders_status", "status"),
+        Index("ix_marketplace_orders_item", "inventory_item_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    remote_order_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    remote_listing_id: Mapped[str | None] = mapped_column(String(200))
+    inventory_item_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("inventory_items.id", ondelete="SET NULL")
+    )
+    buyer_reference: Mapped[str | None] = mapped_column(String(64))
+    sale_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    shipping_charged: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    marketplace_fees: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    promotion_fees: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    payment_state: Mapped[str] = mapped_column(String(50), nullable=False, default="unknown")
+    status: Mapped[OrderStatus] = mapped_column(
+        enum_type(OrderStatus, "order_status"), nullable=False, default=OrderStatus.UNKNOWN
+    )
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ship_by_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    shipped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    refunded_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    payload_checksum: Mapped[str | None] = mapped_column(String(128))
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class MarketplaceOffer(Base):
+    __tablename__ = "marketplace_offers"
+    __table_args__ = (
+        UniqueConstraint("account_id", "remote_offer_id", name="offer_identity"),
+        Index("ix_marketplace_offers_status", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    remote_offer_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    remote_listing_id: Mapped[str | None] = mapped_column(String(200))
+    inventory_item_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("inventory_items.id", ondelete="SET NULL")
+    )
+    buyer_reference: Mapped[str | None] = mapped_column(String(64))
+    offer_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    list_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    status: Mapped[OfferStatus] = mapped_column(
+        enum_type(OfferStatus, "offer_status"), nullable=False, default=OfferStatus.PENDING
+    )
+    decision: Mapped[OfferDecision | None] = mapped_column(
+        enum_type(OfferDecision, "offer_decision")
+    )
+    # The requested action comes from the caller/tool; the executed action is
+    # recorded separately so policy cannot silently substitute one operation
+    # for another.
+    requested_action: Mapped[str | None] = mapped_column(String(30))
+    executed_action: Mapped[str | None] = mapped_column(String(30))
+    counter_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    prior_offer_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class MessageThread(Base):
+    __tablename__ = "message_threads"
+    __table_args__ = (
+        UniqueConstraint("account_id", "remote_thread_id", name="thread_identity"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    remote_thread_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    buyer_reference: Mapped[str | None] = mapped_column(String(64))
+    inventory_item_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("inventory_items.id", ondelete="SET NULL")
+    )
+    last_category: Mapped[str | None] = mapped_column(String(50))
+    escalated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class MessageRecord(Base):
+    __tablename__ = "message_records"
+    __table_args__ = (Index("ix_message_records_thread", "thread_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    thread_id: Mapped[UUID] = mapped_column(
+        ForeignKey("message_threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    direction: Mapped[str] = mapped_column(String(20), nullable=False)
+    category: Mapped[str | None] = mapped_column(String(50))
+    body_checksum: Mapped[str] = mapped_column(String(128), nullable=False)
+    delivered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    escalated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class InventoryReservation(Base):
+    __tablename__ = "inventory_reservations"
+    __table_args__ = (
+        CheckConstraint("version > 0", name="version_positive"),
+        Index("ix_inventory_reservations_item", "inventory_item_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    inventory_item_id: Mapped[UUID] = mapped_column(
+        ForeignKey("inventory_items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reason: Mapped[ReservationReason] = mapped_column(
+        enum_type(ReservationReason, "reservation_reason"), nullable=False
+    )
+    source_marketplace: Mapped[str | None] = mapped_column(String(50))
+    source_listing_id: Mapped[str | None] = mapped_column(String(200))
+    source_order_id: Mapped[str | None] = mapped_column(String(200))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    release_reason: Mapped[str | None] = mapped_column(String(200))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ShippingTask(Base):
+    __tablename__ = "shipping_tasks"
+    __table_args__ = (
+        UniqueConstraint("order_id", name="shipping_task_order"),
+        Index("ix_shipping_tasks_status", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    order_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_orders.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    inventory_item_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("inventory_items.id", ondelete="SET NULL")
+    )
+    status: Mapped[ShippingTaskStatus] = mapped_column(
+        enum_type(ShippingTaskStatus, "shipping_task_status"),
+        nullable=False,
+        default=ShippingTaskStatus.PENDING,
+    )
+    storage_location: Mapped[str | None] = mapped_column(String(200))
+    package_profile: Mapped[str | None] = mapped_column(String(100))
+    estimated_weight_grams: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    confirmed_weight_grams: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    package_dimensions: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    ship_by_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    label_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    label_reference: Mapped[str | None] = mapped_column(String(200))
+    tracking_number: Mapped[str | None] = mapped_column(String(200))
+    carrier: Mapped[str | None] = mapped_column(String(100))
+    shipped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ReconciliationRecord(Base):
+    __tablename__ = "reconciliation_records"
+    __table_args__ = (Index("ix_reconciliation_records_order", "order_id"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    order_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_orders.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[ReconciliationStatus] = mapped_column(
+        enum_type(ReconciliationStatus, "reconciliation_status"),
+        nullable=False,
+        default=ReconciliationStatus.PRELIMINARY,
+    )
+    gross_sale: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    shipping_income: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    shipping_expense: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    marketplace_fees: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    payment_fees: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    promotion_fees: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    item_cost: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    refund_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    net_proceeds: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    realized_profit: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    realized_margin: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False, default=0)
+    discrepancies: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    breakdown: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class AutomationPolicyVersion(Base):
+    __tablename__ = "automation_policy_versions"
+    __table_args__ = (UniqueConstraint("policy_type", "version", name="policy_type_version"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    policy_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    version: Mapped[str] = mapped_column(String(50), nullable=False)
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class PolicyDecision(Base):
+    __tablename__ = "policy_decisions"
+    __table_args__ = (Index("ix_policy_decisions_type", "policy_type", "created_at"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    policy_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    resource_type: Mapped[str | None] = mapped_column(String(80))
+    resource_id: Mapped[UUID | None] = mapped_column(Uuid)
+    inputs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    decision: Mapped[str] = mapped_column(String(80), nullable=False)
+    reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    confidence_requirements: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    risk_score: Mapped[Decimal] = mapped_column(Numeric(4, 3), nullable=False, default=0)
+    warnings: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    execution_result: Mapped[str | None] = mapped_column(String(80))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class CircuitBreaker(Base):
+    __tablename__ = "circuit_breakers"
+    __table_args__ = (
+        UniqueConstraint("scope", "scope_key", name="breaker_scope"),
+        Index("ix_circuit_breakers_state", "state"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    scope: Mapped[str] = mapped_column(String(50), nullable=False)
+    scope_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    state: Mapped[CircuitBreakerState] = mapped_column(
+        enum_type(CircuitBreakerState, "circuit_breaker_state"),
+        nullable=False,
+        default=CircuitBreakerState.CLOSED,
+    )
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    reason: Mapped[str | None] = mapped_column(Text)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+class EmergencyStopState(Base):
+    """Singleton-per-scope emergency stop; scope_key '*' is the global stop."""
+
+    __tablename__ = "emergency_stop_state"
+    __table_args__ = (UniqueConstraint("scope_key", name="emergency_stop_scope"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    scope_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    activated_by: Mapped[str | None] = mapped_column(String(200))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+class WebhookEvent(Base):
+    __tablename__ = "webhook_events"
+    __table_args__ = (
+        UniqueConstraint("source", "external_id", name="webhook_identity"),
+        Index("ix_webhook_events_processed", "processed"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload_checksum: Mapped[str] = mapped_column(String(128), nullable=False)
+    processed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class SynchronizationConflict(Base):
+    __tablename__ = "synchronization_conflicts"
+    __table_args__ = (Index("ix_sync_conflicts_status", "resolved"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    conflict_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    resource_id: Mapped[UUID | None] = mapped_column(Uuid)
+    account_id: Mapped[UUID | None] = mapped_column(Uuid)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    resolution_policy: Mapped[str | None] = mapped_column(String(50))
+    resolved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ExceptionTask(Base):
+    __tablename__ = "exception_tasks"
+    __table_args__ = (
+        CheckConstraint("version > 0", name="version_positive"),
+        Index("ix_exception_tasks_status", "status", "severity"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    exception_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, default="normal")
+    resource_type: Mapped[str | None] = mapped_column(String(80))
+    resource_id: Mapped[UUID | None] = mapped_column(Uuid)
+    account_id: Mapped[UUID | None] = mapped_column(Uuid)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[ExceptionStatus] = mapped_column(
+        enum_type(ExceptionStatus, "exception_status"),
+        nullable=False,
+        default=ExceptionStatus.OPEN,
+    )
+    assigned_to: Mapped[str | None] = mapped_column(String(200))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_notes: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )

@@ -26,6 +26,7 @@ from goliath.db.domain_repositories import (
     PricingRecommendationRepository,
     ResearchRepository,
 )
+from goliath.db.ingestion_repositories import ReviewTaskRepository
 from goliath.db.models import (
     DraftStatus,
     InventoryCondition,
@@ -38,6 +39,7 @@ from goliath.db.models import (
     ProposalStatus,
     ProposalType,
     ResearchStatus,
+    ReviewTaskType,
     SourceReliability,
     utc_now,
 )
@@ -91,6 +93,29 @@ class DomainService:
             resource_type=resource_type,
             resource_id=resource_id,
             details=details or {},
+        )
+
+    def _open_review_task(
+        self,
+        session: Session,
+        *,
+        task_type: ReviewTaskType,
+        resource_type: str,
+        resource_id: UUID,
+        reason: str,
+        priority: int = 100,
+        dedupe_suffix: str = "",
+    ) -> None:
+        """Idempotently open a review task (no duplicate open task per reason/resource)."""
+        due = utc_now() + timedelta(seconds=self._domain.review_task_expiration_seconds)
+        ReviewTaskRepository(session).create_idempotent(
+            task_type=task_type,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            reason=reason,
+            priority=priority,
+            dedupe_suffix=dedupe_suffix,
+            due_at=due,
         )
 
     # ------------------------------------------------------------- inventory
@@ -210,6 +235,15 @@ class DomainService:
                 resource_id=item_id,
                 details={"score": result.score, "blocking": len(result.blocking_errors)},
             )
+            if result.blocking_errors:
+                self._open_review_task(
+                    session,
+                    task_type=ReviewTaskType.INVENTORY_COMPLETION,
+                    resource_type="inventory_item",
+                    resource_id=item_id,
+                    reason="; ".join(result.blocking_errors),
+                    priority=120,
+                )
             session.commit()
             return result
 
@@ -506,6 +540,15 @@ class DomainService:
                 resource_id=research_id,
                 details={"status": status.value, "proposal": str(proposal_id) if proposal_id else None},
             )
+            if status is ResearchStatus.INCONCLUSIVE:
+                self._open_review_task(
+                    session,
+                    task_type=ReviewTaskType.RESEARCH_RESOLUTION,
+                    resource_type="research_record",
+                    resource_id=research_id,
+                    reason="research inconclusive; human resolution required",
+                    priority=140,
+                )
             session.commit()
             session.refresh(record)
             return record, proposal_id
@@ -636,6 +679,86 @@ class DomainService:
             session.refresh(recommendation)
             return recommendation, result
 
+    def recommend_price_with_policy(
+        self,
+        item_id: UUID,
+        *,
+        actor: str,
+        cost_basis: Decimal,
+        fee_version: str | None = None,
+        policy=None,
+    ):
+        """Recommend a price using the configured pricing-source policy.
+
+        Applies the policy (reviewed-only, age, reliability, similarity, currency,
+        outliers), records included/excluded comparables with reasons and the
+        policy version, and opens a pricing-review task when confidence is low.
+        """
+        from goliath.domain.comparables import select_comparables_for_pricing
+
+        policy = policy or self._domain.pricing_source_policy
+        fee_version = fee_version or self._domain.default_fee_version
+        fees = self._domain.fee_versions.get(fee_version)
+        if fees is None:
+            raise DomainError(f"unknown fee version: {fee_version}")
+        comparables = self.find_comparables(item_id)
+        item = self.get_inventory(item_id)
+        selection = select_comparables_for_pricing(comparables, policy=policy)
+        inputs = PricingInputs(
+            cost_basis=Decimal(cost_basis),
+            condition=item.condition.value,
+            comparables=selection.included,
+        )
+        result = calculate_pricing(
+            inputs, rules=self._domain.pricing_rules, fees=fees, fee_version=fee_version
+        )
+        with self._session_factory() as session:
+            recommendation = PricingRecommendationRepository(session).create(
+                inventory_item_id=item_id,
+                created_by=actor,
+                fee_version=fee_version,
+                currency=result.currency,
+                recommended_price=result.recommended_price,
+                fast_sale_price=result.fast_sale_price,
+                minimum_price=result.minimum_price,
+                expected_net_proceeds=result.expected_net_proceeds,
+                expected_profit=result.expected_profit,
+                expected_margin=result.expected_margin,
+                confidence=result.confidence,
+                breakdown=result.breakdown,
+                warnings=result.warnings,
+                inputs=inputs.model_dump(mode="json"),
+                policy_version=selection.policy_version,
+                included_comparables=selection.included_meta,
+                excluded_comparables=selection.excluded_meta,
+            )
+            self._audit(
+                session,
+                "pricing.calculated",
+                actor=actor,
+                resource_type="inventory_item",
+                resource_id=item_id,
+                details={
+                    "recommendation_id": str(recommendation.id),
+                    "policy_version": selection.policy_version,
+                    "included": len(selection.included_meta),
+                    "excluded": len(selection.excluded_meta),
+                },
+            )
+            if float(result.confidence) < self._domain.research_min_confidence:
+                self._open_review_task(
+                    session,
+                    task_type=ReviewTaskType.PRICING_REVIEW,
+                    resource_type="inventory_item",
+                    resource_id=item_id,
+                    reason=f"pricing confidence {result.confidence} below threshold",
+                    priority=100,
+                    dedupe_suffix=str(recommendation.id),
+                )
+            session.commit()
+            session.refresh(recommendation)
+            return recommendation, result
+
     # --------------------------------------------------------- listing drafts
     def create_master_draft(self, item_id: UUID, *, actor: str):
         with self._session_factory() as session:
@@ -670,6 +793,16 @@ class DomainService:
                 resource_id=draft.id,
                 details={"warnings": len(warnings), "missing": len(missing_fields)},
             )
+            if missing_fields:
+                self._open_review_task(
+                    session,
+                    task_type=ReviewTaskType.LISTING_REVIEW,
+                    resource_type="master_listing_draft",
+                    resource_id=draft.id,
+                    reason="listing draft has blocking missing fields: "
+                    + ", ".join(missing_fields),
+                    priority=110,
+                )
             session.commit()
             session.refresh(draft)
             return draft
@@ -837,6 +970,14 @@ class DomainService:
                 resource_type="domain_proposal",
                 resource_id=proposal.id,
                 details={"type": proposal_type.value, "risk": risk_tier},
+            )
+            self._open_review_task(
+                session,
+                task_type=ReviewTaskType.PROPOSAL_REVIEW,
+                resource_type="domain_proposal",
+                resource_id=proposal.id,
+                reason=f"{proposal_type.value} proposal awaiting approval",
+                priority=130,
             )
             session.commit()
             session.refresh(proposal)

@@ -1,0 +1,116 @@
+# Milestone Six example. Export GOLIATH_SESSION_KEY with a generated Fernet key.
+# Keep session_root outside this repository and every configured workspace root.
+workspace_roots:
+  - /srv/resale-goliath/engineering
+
+marketplace:
+  default_mode: disabled
+  operation_modes: {}
+  session:
+    session_root: /var/lib/resale-goliath/sessions
+    require_encryption: true
+    encryption_key: null
+    session_ttl_seconds: 1209600
+    browser_executable: null
+  accounts:
+    ebay-main:
+      marketplace: ebay
+      label: ebay-main
+      automation_mode: disabled  # change to autonomous_conservative after authentication
+      currency: USD
+      allowed_domains: [ebay.com]
+      capabilities: [read_account, read_listings, read_listing, read_orders, read_order,
+        read_offers, read_messages, read_notifications, create_listing, update_listing,
+        refresh_listing, promote_listing, end_listing, accept_offer, decline_offer,
+        counter_offer, send_offer, send_message, update_tracking, estimate_fees,
+        read_shipping_options, purchase_label, sync_account]
+      operation_modes:
+        purchase_label: shadow
+    poshmark-main:
+      marketplace: poshmark
+      label: poshmark-main
+      automation_mode: disabled  # change to autonomous_normal after shadow validation
+      currency: USD
+      allowed_domains: [poshmark.com]
+      capabilities: [read_account, read_listings, read_listing, read_orders, create_listing,
+        update_listing, refresh_listing, share_listing, end_listing, read_offers,
+        accept_offer, decline_offer, counter_offer, send_message, sync_account]
+  publishing:
+    minimum_expected_profit: 12.00
+    require_images: true
+    min_images: 2
+    max_active_listings_per_item: 6
+  cross_listing:
+    strategy: preferred
+    preferred_marketplaces: [ebay, poshmark]
+    category_marketplaces:
+      luxury: [ebay, poshmark, grailed]
+    max_active_listings: 4
+    delayed_secondary_seconds: 900
+  pricing:
+    minimum_net_profit: 12.00
+    maximum_daily_reduction_percent: 10
+    maximum_total_reduction_percent: 40
+    cooldown_hours: 24
+    marketplace_rounding: 1.00
+    stale_thresholds: {14: 5, 30: 8, 60: 12, 90: 15}
+  relisting:
+    enabled: true
+    stale_after_days: 90
+    cooldown_hours: 24
+    maximum_relists: 3
+  offers:
+    minimum_net_profit: 12.00
+    minimum_margin_percent: 20
+    maximum_discount_percent: 35
+    automatic_accept: true
+    automatic_counter: true
+    automatic_decline: true
+    counter_increment: 1.00
+    cooldown_minutes: 60
+  messaging:
+    allowed_categories: [availability, measurements, condition_details, included_accessories,
+      shipping_timing, tracking_status, bundle_requests, price_questions, offer_explanations,
+      thank_you, cancellation_ack]
+    escalation_categories: [threat, harassment, legal_claim, counterfeit_allegation, chargeback,
+      fraud, off_platform_payment, personal_contact_request, tracking_dispute,
+      unusual_refund_demand]
+  shipping:
+    automatic_label_purchase: true
+    maximum_label_cost: 18.00
+    require_confirmed_weight_above: 5.0
+    default_package_profile: polymailer-medium
+  refunds:
+    enabled: true
+    automatic_limit: 30.00
+    allowed_reasons: [order_cancelled_before_shipping, verified_inventory_error, duplicate_sale]
+    require_exception_review_above: 30.00
+  circuit_breaker:
+    failure_threshold: 5
+    cooldown_seconds: 300
+    half_open_probe_after_seconds: 300
+  operation_rate_limit_per_minute: 60
+  max_publish_per_hour: 100
+  max_delisting_latency_seconds: 900
+  reservation_ttl_seconds: 86400
+  max_operation_retries: 5
+  high_value_threshold: 500.00
+  conservative_profit_multiplier: 1.50
+
+agents:
+  hermes-operations:
+    enabled: true
+    adapter: hermes
+    command_template: [hermes, run, --prompt, "{prompt}"]
+    capabilities: [analysis, research]
+    task_types: [research, operations]
+    permissions: [read_files]
+    mcp_scopes: [inventory:read, research:write, pricing:calculate, listing:write_draft,
+      marketplace:read, marketplace:listing:create, marketplace:listing:update,
+      marketplace:listing:refresh, marketplace:listing:end, marketplace:listing:promote,
+      marketplace:offer:respond, marketplace:message:routine, marketplace:order:read,
+      marketplace:tracking:update, marketplace:label:purchase, marketplace:sync]
+    preferred_domain_task_types: [research, operations]
+
+# Tests instantiate FakeMarketplaceAdapter explicitly with encrypted fake session bytes. The fake
+# never performs network I/O and must not be selected silently for a real marketplace account.

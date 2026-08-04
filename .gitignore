@@ -1,0 +1,83 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Coverage, test, and profiling output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+*.prof
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Environment variables, credentials, and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+/config/agents.yaml
+/config/marketplace.yaml
+/config/media.yaml
+/config/mcp-hermes.json
+/config/mcp-http.json
+
+# Local databases, logs, and runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+/data/
+/media/
+/uploads/
+/tmp/
+
+# Local agent/editor state
+/.agents/
+/.claude/
+/.codex/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+
+# Local prompts and review artifacts
+/fix-fastapi-dependencies.txt
+/inspect-api-auth.txt
+/milestone-five.txt
+/milestone-six.txt
+/milestone-six-fixes.txt
+/milestone-six-review.txt
+/review/
+
+# Project scripts are source files (override broad global ignore rules).
+!/scripts/*.sh

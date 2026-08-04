@@ -1,0 +1,14 @@
+{
+  "version": "policy-v1",
+  "reviewed_only": true,
+  "min_comparable_count": 1,
+  "max_comparable_age_days": 180,
+  "sold_weight": 0.7,
+  "active_weight": 0.3,
+  "reliability_threshold": 0.3,
+  "similarity_threshold": 0.3,
+  "outlier_z_threshold": 3.0,
+  "allowed_currencies": ["USD"],
+  "marketplace_weighting": {},
+  "fallback_to_cost_plus": true
+}

@@ -1,0 +1,4 @@
+marketplace,listing_title,source_identity,is_sold,sold_price,listed_price,shipping_price,currency,condition,size,sale_date,source_url,similarity_score,reliability_score
+ebay,Levi's Type III Trucker Jacket M,ebay-1122334455,true,68.00,,7.50,USD,good,M,2026-06-14,https://example.test/ebay/1122334455,0.88,0.80
+poshmark,Vintage Levis Denim Jacket Medium,posh-778899,true,72.00,,,USD,good,M,2026-05-02,https://example.test/posh/778899,0.82,0.70
+grailed,Levis Trucker Type 3,grailed-4455,false,,95.00,,USD,good,M,,https://example.test/grailed/4455,0.75,0.60

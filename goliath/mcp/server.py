@@ -1,8 +1,8 @@
-"""Goliath MCP server: bounded resale-domain tools for agents.
+"""Goliath MCP server: bounded resale-domain and marketplace operation tools.
 
 The server exposes only safe, typed tools. It never exposes raw database
 sessions, unrestricted SQL, shell execution, credentials, marketplace tokens,
-or live-mutation actions. Every call authenticates a service principal, enforces
+or unrestricted live-mutation controls. Every call authenticates a service principal, enforces
 a scope, appends an audit event, and returns controlled errors.
 """
 
@@ -19,6 +19,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from goliath.config import OrchestrationConfig
 from goliath.db.domain_repositories import McpPrincipalRepository
+from goliath.db.marketplace_repositories import (
+    MarketplaceOfferRepository,
+    MarketplaceOrderRepository,
+    MessageRepository,
+    RemoteListingRepository,
+    ShippingTaskRepository,
+)
 from goliath.db.models import (
     Marketplace,
     McpServicePrincipal,
@@ -35,6 +42,9 @@ from goliath.db.repositories import (
 )
 from goliath.domain.pricing import ComparableObservation, PricingInputs
 from goliath.domain.service import DomainError, DomainService
+from goliath.marketplace.broker import SessionBrokerError
+from goliath.marketplace.gateway import GatewayError
+from goliath.marketplace.service import MarketplaceServiceError
 
 # Tools that must never exist on the Goliath MCP surface.
 FORBIDDEN_MCP_TOOLS: frozenset[str] = frozenset(
@@ -115,6 +125,9 @@ class GoliathMcpServer:
         self._session_factory = session_factory
         self._config = config
         self._service = DomainService(session_factory=session_factory, config=config)
+        from goliath.marketplace.service import MarketplaceService
+
+        self._marketplace = MarketplaceService(session_factory=session_factory, config=config)
         self.metrics = McpMetrics()
         self._tools = self._build_tools()
         # Defensive: guarantee no forbidden tool is ever registered.
@@ -149,7 +162,20 @@ class GoliathMcpServer:
         if tool is None:
             raise McpUnknownToolError(f"unknown tool: {tool_name}")
         principal = self.authenticate(credential)
-        if tool.scope not in set(principal.scopes):
+        scopes = set(principal.scopes)
+        is_marketplace = tool_name.startswith("marketplace.")
+        has_scope = tool.scope in scopes or "admin" in scopes
+        if is_marketplace and not has_scope:
+            # Account-scoped marketplace grants are checked against the actual
+            # resource below; a prefix match alone is never authorization.
+            account_ids = self._marketplace_account_ids(tool_name, arguments)
+            scoped = {
+                candidate for candidate in scopes if candidate.startswith(tool.scope + "@")
+            }
+            has_scope = bool(account_ids) and all(
+                f"{tool.scope}@{account_id}" in scoped for account_id in account_ids
+            )
+        if not has_scope:
             self.metrics.authorization_failures += 1
             self._audit_request(principal, tool_name, authorized=False)
             raise McpAuthorizationError(f"scope required: {tool.scope}")
@@ -162,9 +188,47 @@ class GoliathMcpServer:
             RecordNotFoundError,
             InvalidStateTransitionError,
             VersionConflictError,
+            GatewayError,
+            SessionBrokerError,
+            MarketplaceServiceError,
             ValueError,
         ) as error:
             raise McpToolError(str(error)) from error
+
+    def _marketplace_account_ids(self, tool_name: str, payload: dict[str, Any]) -> set[str]:
+        """Resolve marketplace resource ownership before invoking a handler."""
+        if "account_id" in payload:
+            return {str(payload["account_id"])}
+        if "account_ids" in payload:
+            values = {str(value) for value in payload.get("account_ids", [])}
+            if values:
+                return values
+            # A scoped principal cannot safely select every account implicitly.
+            return set()
+        resource_id = next(
+            (payload.get(key) for key in ("listing_id", "offer_id", "order_id", "thread_id", "task_id") if payload.get(key)),
+            None,
+        )
+        if resource_id is None:
+            return set()
+        with self._session_factory() as session:
+            if "listing_id" in payload:
+                row = RemoteListingRepository(session).get(_uuid(resource_id, "listing_id"))
+                return {str(row.account_id)} if row else set()
+            if "offer_id" in payload:
+                row = MarketplaceOfferRepository(session).get(_uuid(resource_id, "offer_id"))
+                return {str(row.account_id)} if row else set()
+            if "order_id" in payload:
+                row = MarketplaceOrderRepository(session).get(_uuid(resource_id, "order_id"))
+                return {str(row.account_id)} if row else set()
+            if "thread_id" in payload:
+                row = MessageRepository(session).get_thread(_uuid(resource_id, "thread_id"))
+                return {str(row.account_id)} if row else set()
+            task = ShippingTaskRepository(session).get(_uuid(resource_id, "task_id"))
+            if task is None:
+                return set()
+            order = MarketplaceOrderRepository(session).get(task.order_id)
+            return {str(order.account_id)} if order else set()
 
     # ---------------------------------------------------------------- audit
     def _audit_request(
@@ -220,6 +284,46 @@ class GoliathMcpServer:
             "approval.get": _Tool("approval:read", _t_approval_get),
             "approval.list": _Tool("approval:read", _t_approval_list),
             "approval.submit": _Tool("approval:request", _t_approval_submit),
+            # Milestone six: genuine marketplace read/write tools (no cookies exposed).
+            "marketplace.account_status": _Tool("marketplace:read", _t_mp_account_status),
+            "marketplace.read_listings": _Tool("marketplace:read", _t_mp_read_listings),
+            "marketplace.read_listing": _Tool("marketplace:read", _t_mp_read_listing),
+            "marketplace.read_orders": _Tool("marketplace:order:read", _t_mp_read_orders),
+            "marketplace.read_offers": _Tool("marketplace:offer:read", _t_mp_read_offers),
+            "marketplace.read_messages": _Tool("marketplace:message:read", _t_mp_read_messages),
+            "marketplace.read_notifications": _Tool(
+                "marketplace:read", _t_mp_read_notifications
+            ),
+            "marketplace.sync_account": _Tool("marketplace:sync", _t_mp_sync_account),
+            "marketplace.create_listing": _Tool(
+                "marketplace:listing:create", _t_mp_create_listing
+            ),
+            "marketplace.refresh_listing": _Tool(
+                "marketplace:listing:refresh", _t_mp_refresh_listing
+            ),
+            "marketplace.update_listing": _Tool(
+                "marketplace:listing:update", _t_mp_update_listing
+            ),
+            "marketplace.promote_listing": _Tool(
+                "marketplace:listing:promote", _t_mp_promote_listing
+            ),
+            "marketplace.share_listing": _Tool(
+                "marketplace:listing:share", _t_mp_share_listing
+            ),
+            "marketplace.end_listing": _Tool("marketplace:listing:end", _t_mp_end_listing),
+            "marketplace.send_offer": _Tool("marketplace:offer:respond", _t_mp_send_offer),
+            "marketplace.accept_offer": _Tool("marketplace:offer:respond", _t_mp_accept_offer),
+            "marketplace.decline_offer": _Tool("marketplace:offer:respond", _t_mp_decline_offer),
+            "marketplace.counter_offer": _Tool("marketplace:offer:respond", _t_mp_counter_offer),
+            "marketplace.send_message": _Tool(
+                "marketplace:message:routine", _t_mp_send_message
+            ),
+            "marketplace.update_tracking": _Tool(
+                "marketplace:tracking:update", _t_mp_update_tracking
+            ),
+            "marketplace.purchase_label": _Tool(
+                "marketplace:label:purchase", _t_mp_purchase_label
+            ),
         }
 
 
@@ -564,3 +668,313 @@ def _t_approval_submit(server: GoliathMcpServer, principal, payload):
         risk_tier=str(payload.get("risk_tier", "medium")),
     )
     return _proposal_dict(proposal)
+
+
+# --------------------------------------------------------------------------- #
+# Milestone six marketplace tool handlers (bounded; never expose session state)
+# --------------------------------------------------------------------------- #
+
+
+def _run_async(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def _t_mp_account_status(server: GoliathMcpServer, principal, payload):
+    account = server._marketplace.get_account(_uuid(_require(payload, "account_id"), "account_id"))
+    return {
+        "id": str(account.id),
+        "marketplace": account.marketplace.value,
+        "mode": account.automation_mode.value,
+        "status": account.status.value,
+    }
+
+
+def _t_mp_read_listings(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.read_listings_remote(
+            _uuid(_require(payload, "account_id"), "account_id"),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_read_listing(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.read_listing(
+            _uuid(_require(payload, "listing_id"), "listing_id"),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_read_orders(server: GoliathMcpServer, principal, payload):
+    account_id = _uuid(_require(payload, "account_id"), "account_id")
+    receipt = _run_async(
+        server._marketplace.read_orders_remote(
+            account_id,
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_read_offers(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.read_offers_remote(
+            _uuid(_require(payload, "account_id"), "account_id"),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_read_messages(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.read_messages_remote(
+            _uuid(_require(payload, "account_id"), "account_id"),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_read_notifications(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.read_notifications_remote(
+            _uuid(_require(payload, "account_id"), "account_id"),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_sync_account(server: GoliathMcpServer, principal, payload):
+    account_id = _uuid(_require(payload, "account_id"), "account_id")
+    result = _run_async(
+        server._marketplace.sync_account(
+            account_id, principal_scopes=set(principal.scopes), actor=server._actor(principal)
+        )
+    )
+    if isinstance(result, dict) and isinstance(result.get("adapter"), dict):
+        result = dict(result)
+        result["adapter"] = _safe_marketplace_payload("sync_account", result["adapter"])
+    return result
+
+
+def _t_mp_create_listing(server: GoliathMcpServer, principal, payload):
+    item_id = _uuid(_require(payload, "item_id"), "item_id")
+    account_ids = [_uuid(a, "account_id") for a in payload.get("account_ids", [])] or None
+    return _run_async(
+        server._marketplace.publish_item(
+            item_id,
+            account_ids=account_ids,
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+
+
+def _t_mp_refresh_listing(server: GoliathMcpServer, principal, payload):
+    listing_id = _uuid(_require(payload, "listing_id"), "listing_id")
+    receipt = _run_async(
+        server._marketplace.refresh_listing(
+            listing_id, principal_scopes=set(principal.scopes), actor=server._actor(principal)
+        )
+    )
+    return {"ok": receipt.ok, "verified": receipt.verified}
+
+
+def _t_mp_update_listing(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.update_listing(
+            _uuid(_require(payload, "listing_id"), "listing_id"),
+            fields=dict(_require(payload, "fields")),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_promote_listing(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.promote_listing(
+            _uuid(_require(payload, "listing_id"), "listing_id"),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_share_listing(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.share_listing(
+            _uuid(_require(payload, "listing_id"), "listing_id"),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_end_listing(server: GoliathMcpServer, principal, payload):
+    listing_id = _uuid(_require(payload, "listing_id"), "listing_id")
+    receipt = _run_async(
+        server._marketplace.end_listing(
+            listing_id, principal_scopes=set(principal.scopes), actor=server._actor(principal)
+        )
+    )
+    return {"ok": receipt.ok, "verified": receipt.verified}
+
+
+def _execute_policy_offer(server: GoliathMcpServer, principal, payload, requested: str):
+    offer_id = _uuid(_require(payload, "offer_id"), "offer_id")
+    counter_amount = payload.get("counter_amount")
+    if requested == "counter" and counter_amount is None:
+        raise McpToolError("counter_offer requires counter_amount")
+    result = _run_async(
+        server._marketplace.handle_offer(
+            offer_id,
+            requested_action=requested,
+            requested_counter_amount=(
+                _decimal(counter_amount, "counter_amount") if counter_amount is not None else None
+            ),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return result
+
+
+def _t_mp_accept_offer(server: GoliathMcpServer, principal, payload):
+    return _execute_policy_offer(server, principal, payload, "accept")
+
+
+def _t_mp_decline_offer(server: GoliathMcpServer, principal, payload):
+    return _execute_policy_offer(server, principal, payload, "decline")
+
+
+def _t_mp_counter_offer(server: GoliathMcpServer, principal, payload):
+    return _execute_policy_offer(server, principal, payload, "counter")
+
+
+def _t_mp_send_offer(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.send_offer(
+            _uuid(_require(payload, "listing_id"), "listing_id"),
+            _decimal(_require(payload, "amount"), "amount"),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_send_message(server: GoliathMcpServer, principal, payload):
+    thread_id = _uuid(_require(payload, "thread_id"), "thread_id")
+    return _run_async(
+        server._marketplace.respond_message(
+            thread_id,
+            str(_require(payload, "body")),
+            facts=payload.get("facts", {}),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+
+
+def _t_mp_update_tracking(server: GoliathMcpServer, principal, payload):
+    receipt = _run_async(
+        server._marketplace.update_tracking(
+            _uuid(_require(payload, "order_id"), "order_id"),
+            str(_require(payload, "tracking_number")),
+            str(_require(payload, "carrier")),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+    return _receipt_dict(receipt)
+
+
+def _t_mp_purchase_label(server: GoliathMcpServer, principal, payload):
+    return _run_async(
+        server._marketplace.purchase_label(
+            _uuid(_require(payload, "task_id"), "task_id"),
+            principal_scopes=set(principal.scopes),
+            actor=server._actor(principal),
+        )
+    )
+
+
+def _receipt_dict(receipt) -> dict[str, Any]:
+    return {
+        "ok": receipt.ok,
+        "operation": receipt.operation,
+        "executed": receipt.executed,
+        "shadowed": receipt.shadowed,
+        "verified": receipt.verified,
+        "remote_id": receipt.remote_id,
+        "error_category": receipt.error_category,
+        "reasons": receipt.reasons,
+        "data": _safe_marketplace_payload(receipt.operation, receipt.data),
+    }
+
+
+def _safe_marketplace_payload(operation: str, payload: Any) -> dict[str, Any]:
+    """Return a narrow, buyer-safe projection of adapter output.
+
+    Adapter payloads are internal and may contain arbitrary marketplace fields.
+    MCP callers receive only stable identifiers and operational state.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    keys = {
+        "read_listings": {"listings"},
+        "read_listing": {"id", "remote_listing_id", "status", "title", "price", "currency"},
+        "read_orders": {"orders"},
+        "read_order": {"id", "remote_order_id", "status", "sale_price", "currency", "tracking_number", "carrier"},
+        "read_offers": {"offers"},
+        "read_messages": {"messages"},
+        "read_notifications": {"notifications"},
+        "purchase_label": {"label_reference", "tracking_number", "carrier", "cost"},
+        "update_tracking": {"tracking_number", "carrier"},
+    }.get(operation)
+    if keys is None:
+        # Write receipts have operation-specific, non-sensitive confirmations.
+        keys = {
+            "status", "refreshed", "promoted", "shared", "state", "sent", "delivered",
+            "label_reference", "tracking_number", "carrier", "cost", "amount", "category",
+        }
+    result = {key: payload[key] for key in keys if key in payload}
+    if operation in {"read_listings", "read_orders", "read_offers", "read_messages", "read_notifications"}:
+        collection = next(iter(keys))
+        values = payload.get(collection, [])
+        if not isinstance(values, list):
+            result[collection] = []
+        else:
+            result[collection] = [
+                _safe_marketplace_row(operation, value) for value in values if isinstance(value, dict)
+            ]
+    return result
+
+
+def _safe_marketplace_row(operation: str, row: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "read_listings": {"id", "remote_listing_id", "status", "title", "price", "currency"},
+        "read_orders": {"id", "remote_order_id", "status", "sale_price", "currency", "tracking_number", "carrier"},
+        "read_offers": {"id", "remote_offer_id", "status", "offer_amount", "list_price", "currency"},
+        "read_messages": {"id", "remote_thread_id", "category", "direction", "delivered"},
+        "read_notifications": {"id", "type", "status", "created_at"},
+    }.get(operation, set())
+    return {key: row[key] for key in allowed if key in row}

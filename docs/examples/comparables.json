@@ -1,0 +1,12 @@
+{
+  "comparables": [
+    {"marketplace": "ebay", "listing_title": "Levi's Type III Trucker Jacket M",
+     "source_identity": "ebay-1122334455", "is_sold": true, "sold_price": "68.00",
+     "shipping_price": "7.50", "currency": "USD", "condition": "good", "size": "M",
+     "sale_date": "2026-06-14", "similarity_score": "0.88", "reliability_score": "0.80"},
+    {"marketplace": "poshmark", "listing_title": "Vintage Levis Denim Jacket Medium",
+     "source_identity": "posh-778899", "is_sold": true, "sold_price": "72.00",
+     "currency": "USD", "condition": "good", "size": "M", "sale_date": "2026-05-02",
+     "similarity_score": "0.82", "reliability_score": "0.70"}
+  ]
+}
