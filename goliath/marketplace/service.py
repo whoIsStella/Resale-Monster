@@ -113,8 +113,13 @@ class MarketplaceService:
 
     # -------------------------------------------------------------- accounts
     def create_account(
-        self, *, marketplace: str, label: str, currency: str = "USD",
-        capabilities: list[str] | None = None, actor: str = "human:operator",
+        self,
+        *,
+        marketplace: str,
+        label: str,
+        currency: str = "USD",
+        capabilities: list[str] | None = None,
+        actor: str = "human:operator",
     ):
         with self._session_factory() as session:
             account = MarketplaceAccountRepository(session).create(
@@ -178,7 +183,11 @@ class MarketplaceService:
                 actor_id=actor.partition(":")[2] or actor,
                 resource_type="marketplace_account",
                 resource_id=account_id,
-                details={"from": previous, "to": target.value, "mode_version": account.mode_version},
+                details={
+                    "from": previous,
+                    "to": target.value,
+                    "mode_version": account.mode_version,
+                },
             )
             session.commit()
             session.refresh(account)
@@ -240,30 +249,137 @@ class MarketplaceService:
                 "active_stops": [s.scope_key for s in active],
             }
 
-    async def read_account_remote(self, account_id: UUID, *, principal_scopes=None, actor="system:sync"):
+    async def read_account_remote(
+        self, account_id: UUID, *, principal_scopes=None, actor="system:sync"
+    ):
         return await self._read_account_operation(
             account_id, "read_account", "marketplace:read", principal_scopes, actor
         )
 
-    async def read_listings_remote(self, account_id: UUID, *, principal_scopes=None, actor="system:sync"):
+    async def health_check_remote(
+        self, account_id: UUID, *, principal_scopes=None, actor="system:health"
+    ):
+        return await self._read_account_operation(
+            account_id, "health_check", "marketplace:read", principal_scopes, actor
+        )
+
+    async def read_listings_remote(
+        self, account_id: UUID, *, principal_scopes=None, actor="system:sync"
+    ):
         return await self._read_account_operation(
             account_id, "read_listings", "marketplace:read", principal_scopes, actor
         )
 
-    async def read_offers_remote(self, account_id: UUID, *, principal_scopes=None, actor="system:sync"):
+    async def read_offers_remote(
+        self, account_id: UUID, *, principal_scopes=None, actor="system:sync"
+    ):
         return await self._read_account_operation(
             account_id, "read_offers", "marketplace:offer:read", principal_scopes, actor
         )
 
-    async def read_orders_remote(self, account_id: UUID, *, principal_scopes=None, actor="system:sync"):
+    async def sync_offers(
+        self, account_id: UUID, *, principal_scopes=None, actor="system:offers"
+    ) -> dict[str, Any]:
+        receipt = await self.read_offers_remote(
+            account_id, principal_scopes=principal_scopes, actor=actor
+        )
+        if not receipt.ok:
+            return {
+                "status": "skipped" if receipt.error_category == "not_supported" else "failed",
+                "reason": receipt.error_category or "offer_sync_failed",
+                "synced": 0,
+            }
+        synced = 0
+        with self._session_factory() as session:
+            repo = MarketplaceOfferRepository(session)
+            for raw in receipt.data.get("offers", []):
+                remote_offer_id = str(raw.get("remote_offer_id", "")).strip()
+                if not remote_offer_id or raw.get("offer_amount") is None:
+                    continue
+                item_id = (
+                    UUID(str(raw["inventory_item_id"])) if raw.get("inventory_item_id") else None
+                )
+                repo.upsert(
+                    account_id=account_id,
+                    remote_offer_id=remote_offer_id,
+                    offer_amount=Decimal(str(raw["offer_amount"])),
+                    list_price=(
+                        Decimal(str(raw["list_price"]))
+                        if raw.get("list_price") is not None
+                        else None
+                    ),
+                    inventory_item_id=item_id,
+                    prior_offer_count=int(raw.get("prior_offer_count", 0)),
+                )
+                synced += 1
+            session.commit()
+        return {"status": "succeeded", "synced": synced}
+
+    async def read_orders_remote(
+        self, account_id: UUID, *, principal_scopes=None, actor="system:sync"
+    ):
         return await self._read_account_operation(
             account_id, "read_orders", "marketplace:order:read", principal_scopes, actor
         )
 
-    async def read_messages_remote(self, account_id: UUID, *, principal_scopes=None, actor="system:sync"):
+    async def read_messages_remote(
+        self, account_id: UUID, *, principal_scopes=None, actor="system:sync"
+    ):
         return await self._read_account_operation(
             account_id, "read_messages", "marketplace:message:read", principal_scopes, actor
         )
+
+    async def process_routine_messages(
+        self, account_id: UUID, *, principal_scopes=None, actor="system:messaging"
+    ) -> dict[str, Any]:
+        """Synchronize and respond without persisting plaintext buyer messages."""
+        receipt = await self.read_messages_remote(
+            account_id, principal_scopes=principal_scopes, actor=actor
+        )
+        if not receipt.ok:
+            return {
+                "status": "skipped" if receipt.error_category == "not_supported" else "failed",
+                "reason": receipt.error_category or "message_sync_failed",
+                "processed": 0,
+            }
+        processed = 0
+        skipped = 0
+        for raw in receipt.data.get("messages", []):
+            remote_thread_id = str(raw.get("remote_thread_id", "")).strip()
+            body = str(raw.get("body", "")).strip()
+            if not remote_thread_id or not body:
+                skipped += 1
+                continue
+            checksum = hashlib.sha256(body.encode()).hexdigest()
+            buyer_reference = (
+                hashlib.sha256(str(raw["buyer"]).encode()).hexdigest()[:16]
+                if raw.get("buyer")
+                else None
+            )
+            item_id = UUID(str(raw["inventory_item_id"])) if raw.get("inventory_item_id") else None
+            with self._session_factory() as session:
+                messages = MessageRepository(session)
+                thread = messages.upsert_thread(
+                    account_id=account_id,
+                    remote_thread_id=remote_thread_id,
+                    inventory_item_id=item_id,
+                    buyer_reference=buyer_reference,
+                )
+                duplicate = messages.has_message_checksum(thread.id, checksum)
+                thread_id = thread.id
+                session.commit()
+            if duplicate:
+                skipped += 1
+                continue
+            await self.respond_message(
+                thread_id,
+                body,
+                facts=dict(raw.get("facts") or {}),
+                principal_scopes=principal_scopes,
+                actor=actor,
+            )
+            processed += 1
+        return {"status": "succeeded", "processed": processed, "skipped": skipped}
 
     async def read_notifications_remote(
         self, account_id: UUID, *, principal_scopes=None, actor="system:sync"
@@ -287,7 +403,7 @@ class MarketplaceService:
         )
 
     async def sync_account(self, account_id: UUID, *, principal_scopes=None, actor="system:sync"):
-        """Run adapter synchronization plus idempotent order ingestion."""
+        """Run account synchronization; order ingestion has its own durable workflow."""
         receipt = await self._gateway.execute(
             account_id=account_id,
             operation="sync_account",
@@ -298,15 +414,10 @@ class MarketplaceService:
             resource_type="marketplace_account",
             resource_id=account_id,
         )
-        orders = await self.sync_orders(
-            account_id, principal_scopes=principal_scopes, actor=actor
-        )
-        adapter_summary = {
-            key: receipt.data[key]
-            for key in ("marketplace", "synced", "listings", "orders", "offers")
-            if key in receipt.data
-        }
-        return {"ok": receipt.ok and orders.get("ok", False), "adapter": adapter_summary, **orders}
+        with self._session_factory() as session:
+            MarketplaceAccountRepository(session).record_sync(account_id, success=receipt.ok)
+            session.commit()
+        return receipt
 
     # ---------------------------------------------------------------- publish
     def _publishing_eligibility(self, session, item, account) -> P.PolicyOutcome:
@@ -463,7 +574,9 @@ class MarketplaceService:
                     )
                     session.commit()
                 self._audit(
-                    "listing.published", "remote_listing", listing_id,
+                    "listing.published",
+                    "remote_listing",
+                    listing_id,
                     {"account": label, "verified": receipt.verified},
                 )
                 results[label] = "published"
@@ -471,7 +584,8 @@ class MarketplaceService:
             else:
                 with self._session_factory() as session:
                     RemoteListingRepository(session).set_status(
-                        listing_id, status=RemoteListingStatus.FAILED,
+                        listing_id,
+                        status=RemoteListingStatus.FAILED,
                         error_category=receipt.error_category,
                     )
                     session.commit()
@@ -487,8 +601,10 @@ class MarketplaceService:
                 item = InventoryRepository(session).get(item_id)
                 if item.status is not InventoryStatus.LISTED:
                     InventoryRepository(session).update_draft(
-                        item_id, expected_version=item.version,
-                        changes={"status": "listed"}, allow_human_only_status=True,
+                        item_id,
+                        expected_version=item.version,
+                        changes={"status": "listed"},
+                        allow_human_only_status=True,
                     )
                 session.commit()
         return {"item_id": str(item_id), "results": results}
@@ -514,26 +630,39 @@ class MarketplaceService:
             return False
         listings = result.data.get("listings", [])
         return any(
-            str(x.get("status")) == "active"
-            and x.get("idempotency_key") == idempotency_key
+            str(x.get("status")) == "active" and x.get("idempotency_key") == idempotency_key
             for x in listings
         )
 
     # ------------------------------------------------------- refresh/promote
-    async def refresh_listing(self, listing_id: UUID, *, principal_scopes=None, actor="system:scheduler"):
+    async def refresh_listing(
+        self, listing_id: UUID, *, principal_scopes=None, actor="system:scheduler"
+    ):
         return await self._simple_listing_op(
-            listing_id, "refresh_listing", "marketplace:listing:refresh",
-            lambda adapter, rid: adapter.refresh_listing(rid), principal_scopes, actor,
+            listing_id,
+            "refresh_listing",
+            "marketplace:listing:refresh",
+            lambda adapter, rid: adapter.refresh_listing(rid),
+            principal_scopes,
+            actor,
             verified_action="refresh",
         )
 
-    async def promote_listing(self, listing_id: UUID, *, principal_scopes=None, actor="system:scheduler"):
+    async def promote_listing(
+        self, listing_id: UUID, *, principal_scopes=None, actor="system:scheduler"
+    ):
         return await self._simple_listing_op(
-            listing_id, "promote_listing", "marketplace:listing:promote",
-            lambda adapter, rid: adapter.promote_listing(rid), principal_scopes, actor,
+            listing_id,
+            "promote_listing",
+            "marketplace:listing:promote",
+            lambda adapter, rid: adapter.promote_listing(rid),
+            principal_scopes,
+            actor,
         )
 
-    async def share_listing(self, listing_id: UUID, *, principal_scopes=None, actor="system:scheduler"):
+    async def share_listing(
+        self, listing_id: UUID, *, principal_scopes=None, actor="system:scheduler"
+    ):
         return await self._simple_listing_op(
             listing_id,
             "share_listing",
@@ -607,7 +736,7 @@ class MarketplaceService:
             account_id, remote_id = listing.account_id, listing.remote_listing_id
         if remote_id is None:
             raise MarketplaceServiceError("listing has no remote id")
-        return await self._gateway.execute(
+        receipt = await self._gateway.execute(
             account_id=account_id,
             operation="read_listing",
             scope="marketplace:read",
@@ -617,6 +746,17 @@ class MarketplaceService:
             resource_type="remote_listing",
             resource_id=listing_id,
         )
+        if receipt.ok:
+            with self._session_factory() as session:
+                listing = RemoteListingRepository(session).get(listing_id)
+                if listing is not None:
+                    listing.last_synced_at = utc_now()
+                    remote_status = receipt.data.get("status")
+                    if remote_status in {value.value for value in RemoteListingStatus}:
+                        listing.status = RemoteListingStatus(remote_status)
+                    listing.local_version += 1
+                session.commit()
+        return receipt
 
     async def send_offer(
         self,
@@ -632,11 +772,15 @@ class MarketplaceService:
                 raise RecordNotFoundError(f"remote listing not found: {listing_id}")
             account_id, remote_id = listing.account_id, listing.remote_listing_id
             item = InventoryRepository(session).get(listing.inventory_item_id)
-            reserved = bool(ReservationRepository(session).active_for_item(listing.inventory_item_id))
+            reserved = bool(
+                ReservationRepository(session).active_for_item(listing.inventory_item_id)
+            )
             cost = item.acquisition_cost if item else Decimal(0)
         minimum = cost + self._marketplace.offers.minimum_net_profit
         if reserved or amount < minimum:
-            raise MarketplaceServiceError("outbound offer violates reservation or minimum-profit policy")
+            raise MarketplaceServiceError(
+                "outbound offer violates reservation or minimum-profit policy"
+            )
         idem = hashlib.sha256(f"send-offer:{listing_id}:{amount}".encode()).hexdigest()[:32]
         return await self._gateway.execute(
             account_id=account_id,
@@ -651,7 +795,9 @@ class MarketplaceService:
             request_summary={"amount": str(amount)},
         )
 
-    async def end_listing(self, listing_id: UUID, *, principal_scopes=None, actor="system:scheduler"):
+    async def end_listing(
+        self, listing_id: UUID, *, principal_scopes=None, actor="system:scheduler"
+    ):
         return await self._end_listing(listing_id, principal_scopes=principal_scopes, actor=actor)
 
     async def _simple_listing_op(
@@ -702,18 +848,28 @@ class MarketplaceService:
             with self._session_factory() as session:
                 MarketplaceAccountRepository(session).record_sync(account_id, success=False)
                 session.commit()
-            return {"ok": False, "reason": receipt.reasons}
+            return {
+                "ok": False,
+                "reason": receipt.reasons,
+                "error_category": receipt.error_category,
+            }
         detected = 0
         for raw in receipt.data.get("orders", []):
             order, is_new = self._upsert_order(account_id, raw)
             if is_new:
                 detected += 1
                 self._audit(
-                    "sale.detected", "marketplace_order", UUID(order["id"]),
+                    "sale.detected",
+                    "marketplace_order",
+                    UUID(order["id"]),
                     {"account": str(account_id)},
                 )
                 if order["status"] in {OrderStatus.PAID.value, OrderStatus.READY_TO_SHIP.value}:
-                    await self._on_sale(UUID(order["id"]), UUID(order["item_id"]) if order.get("item_id") else None, actor)
+                    await self._on_sale(
+                        UUID(order["id"]),
+                        UUID(order["item_id"]) if order.get("item_id") else None,
+                        actor,
+                    )
         with self._session_factory() as session:
             MarketplaceAccountRepository(session).record_sync(account_id, success=True)
             session.commit()
@@ -763,20 +919,27 @@ class MarketplaceService:
                     reason=ReservationReason.PAID_SALE,
                     created_by=actor,
                     source_order_id=str(order_id),
-                    expires_at=utc_now() + timedelta(seconds=self._marketplace.reservation_ttl_seconds),
+                    expires_at=utc_now()
+                    + timedelta(seconds=self._marketplace.reservation_ttl_seconds),
                 )
             inventory = InventoryRepository(session)
             item = inventory.get(item_id)
             if item and item.status not in {InventoryStatus.SOLD}:
                 inventory.update_draft(
-                    item_id, expected_version=item.version,
-                    changes={"status": "reserved"}, allow_human_only_status=True,
+                    item_id,
+                    expected_version=item.version,
+                    changes={"status": "reserved"},
+                    allow_human_only_status=True,
                 )
             listings = list(RemoteListingRepository(session).list_active_for_item(item_id))
             listing_ids = [listing.id for listing in listings]
             AuditEventRepository(session).append(
-                event_type="inventory.reserved", actor_type="system", actor_id="marketplace",
-                resource_type="inventory_item", resource_id=item_id, details={"order": str(order_id)},
+                event_type="inventory.reserved",
+                actor_type="system",
+                actor_id="marketplace",
+                resource_type="inventory_item",
+                resource_id=item_id,
+                details={"order": str(order_id)},
             )
             self._create_shipping_task(session, order_id, item_id)
             session.commit()
@@ -805,8 +968,10 @@ class MarketplaceService:
                     detail={"failed": [str(x) for x in failed], "latency_seconds": latency},
                 )
                 CircuitBreakerRepository(session).record_failure(
-                    scope="item", scope_key=str(item_id),
-                    threshold=1, cooldown_seconds=self._marketplace.circuit_breaker.cooldown_seconds,
+                    scope="item",
+                    scope_key=str(item_id),
+                    threshold=1,
+                    cooldown_seconds=self._marketplace.circuit_breaker.cooldown_seconds,
                     reason="delisting_failure",
                 )
                 session.commit()
@@ -816,13 +981,19 @@ class MarketplaceService:
                 item = InventoryRepository(session).get(item_id)
                 if item and item.status is not InventoryStatus.SOLD:
                     InventoryRepository(session).update_draft(
-                        item_id, expected_version=item.version,
-                        changes={"status": "sold"}, allow_human_only_status=True,
+                        item_id,
+                        expected_version=item.version,
+                        changes={"status": "sold"},
+                        allow_human_only_status=True,
                     )
                 session.commit()
-            self._audit("delisting.verified", "inventory_item", item_id, {"latency_seconds": latency})
+            self._audit(
+                "delisting.verified", "inventory_item", item_id, {"latency_seconds": latency}
+            )
 
-    async def _end_listing(self, listing_id, *, principal_scopes=None, actor="system", on_sale=False):
+    async def _end_listing(
+        self, listing_id, *, principal_scopes=None, actor="system", on_sale=False
+    ):
         with self._session_factory() as session:
             listing = RemoteListingRepository(session).get(listing_id)
             if listing is None:
@@ -860,13 +1031,25 @@ class MarketplaceService:
 
     def _create_shipping_task(self, session, order_id, item_id) -> None:
         item = InventoryRepository(session).get(item_id) if item_id else None
-        ShippingTaskRepository(session).create_for_order(
+        task = ShippingTaskRepository(session).create_for_order(
             order_id=order_id,
             inventory_item_id=item_id,
             package_profile=self._marketplace.shipping.default_package_profile,
             estimated_weight_grams=item.packed_weight_grams if item else None,
             storage_location=item.storage_location if item else None,
         )
+        if item is not None and item.package_dimensions:
+            task.package_dimensions = dict(item.package_dimensions)
+        dimensions = task.package_dimensions or {}
+        if (
+            task.package_profile
+            and task.estimated_weight_grams is not None
+            and task.estimated_weight_grams > 0
+            and all(
+                Decimal(str(dimensions.get(key, 0))) > 0 for key in ("length", "width", "height")
+            )
+        ):
+            task.status = ShippingTaskStatus.READY
 
     # -------------------------------------------------------------- offers
     async def handle_offer(
@@ -878,7 +1061,11 @@ class MarketplaceService:
         principal_scopes=None,
         actor="system:offers",
     ):
-        if requested_action is not None and requested_action not in {"accept", "decline", "counter"}:
+        if requested_action is not None and requested_action not in {
+            "accept",
+            "decline",
+            "counter",
+        }:
             raise MarketplaceServiceError("unsupported requested offer action")
         if requested_action == "counter":
             if requested_counter_amount is None or requested_counter_amount <= 0:
@@ -962,14 +1149,19 @@ class MarketplaceService:
                 resource_id=offer_id,
             )
             session.commit()
-        self._audit("offer.evaluated", "marketplace_offer", offer_id, {"decision": outcome.decision})
+        self._audit(
+            "offer.evaluated", "marketplace_offer", offer_id, {"decision": outcome.decision}
+        )
 
         if outcome.decision in {"escalate", "defer"}:
             if outcome.decision == "escalate":
                 with self._session_factory() as session:
                     ExceptionTaskRepository(session).create(
-                        exception_type="offer_escalation", reason="; ".join(outcome.reasons),
-                        resource_type="marketplace_offer", resource_id=offer_id, account_id=account_id,
+                        exception_type="offer_escalation",
+                        reason="; ".join(outcome.reasons),
+                        resource_type="marketplace_offer",
+                        resource_id=offer_id,
+                        account_id=account_id,
                     )
                     MarketplaceOfferRepository(session).record_decision(
                         offer_id,
@@ -988,8 +1180,11 @@ class MarketplaceService:
         }
         operation, decision_enum, status_enum = action_map[outcome.decision]
         counter_amount = (
-            _money(requested_counter_amount if requested_counter_amount is not None
-                   else Decimal(outcome.data["counter_amount"]))
+            _money(
+                requested_counter_amount
+                if requested_counter_amount is not None
+                else Decimal(outcome.data["counter_amount"])
+            )
             if outcome.decision == "counter"
             else None
         )
@@ -1013,14 +1208,18 @@ class MarketplaceService:
         if receipt.ok:
             with self._session_factory() as session:
                 MarketplaceOfferRepository(session).record_decision(
-                    offer_id, decision=decision_enum, status=status_enum,
+                    offer_id,
+                    decision=decision_enum,
+                    status=status_enum,
                     counter_amount=counter_amount,
                     requested_action=requested_action or outcome.decision,
                     executed_action=outcome.decision,
                     responded=True,
                 )
                 session.commit()
-            self._audit("offer.response_sent", "marketplace_offer", offer_id, {"decision": outcome.decision})
+            self._audit(
+                "offer.response_sent", "marketplace_offer", offer_id, {"decision": outcome.decision}
+            )
         return {
             "decision": outcome.decision,
             "ok": receipt.ok,
@@ -1031,8 +1230,13 @@ class MarketplaceService:
 
     # ------------------------------------------------------------- messaging
     async def respond_message(
-        self, thread_id: UUID, body: str, *, facts: dict[str, Any] | None = None,
-        principal_scopes=None, actor="system:messaging",
+        self,
+        thread_id: UUID,
+        body: str,
+        *,
+        facts: dict[str, Any] | None = None,
+        principal_scopes=None,
+        actor="system:messaging",
     ):
         with self._session_factory() as session:
             thread = MessageRepository(session).get_thread(thread_id)
@@ -1041,7 +1245,9 @@ class MarketplaceService:
             account_id = thread.account_id
             remote_thread_id = thread.remote_thread_id
             MessageRepository(session).add_message(
-                thread_id, direction="inbound", category=None,
+                thread_id,
+                direction="inbound",
+                category=None,
                 body_checksum=hashlib.sha256(body.encode()).hexdigest(),
             )
             session.commit()
@@ -1052,12 +1258,18 @@ class MarketplaceService:
         if outcome.decision == "escalate":
             with self._session_factory() as session:
                 MessageRepository(session).add_message(
-                    thread_id, direction="system", category=category,
-                    body_checksum="escalated", escalated=True,
+                    thread_id,
+                    direction="system",
+                    category=category,
+                    body_checksum="escalated",
+                    escalated=True,
                 )
                 ExceptionTaskRepository(session).create(
-                    exception_type="message_escalation", reason=f"category: {category}",
-                    resource_type="message_thread", resource_id=thread_id, account_id=account_id,
+                    exception_type="message_escalation",
+                    reason=f"category: {category}",
+                    resource_type="message_thread",
+                    resource_id=thread_id,
+                    account_id=account_id,
                 )
                 session.commit()
             self._audit("message.escalated", "message_thread", thread_id, {"category": category})
@@ -1086,7 +1298,9 @@ class MarketplaceService:
         )
         with self._session_factory() as session:
             MessageRepository(session).add_message(
-                thread_id, direction="outbound", category=category,
+                thread_id,
+                direction="outbound",
+                category=category,
                 body_checksum=hashlib.sha256(response.encode()).hexdigest(),
                 delivered=receipt.ok and receipt.data.get("delivered", False),
             )
@@ -1095,7 +1309,9 @@ class MarketplaceService:
         return {"decision": "respond", "category": category, "ok": receipt.ok}
 
     # ------------------------------------------------------- price automation
-    async def run_price_automation(self, listing_id: UUID, *, principal_scopes=None, actor="system:pricing"):
+    async def run_price_automation(
+        self, listing_id: UUID, *, principal_scopes=None, actor="system:pricing"
+    ):
         with self._session_factory() as session:
             listing = RemoteListingRepository(session).get(listing_id)
             if listing is None:
@@ -1104,38 +1320,49 @@ class MarketplaceService:
             remote_id = listing.remote_listing_id
             current_price = listing.current_price or Decimal(0)
             item = InventoryRepository(session).get(listing.inventory_item_id)
-            reserved = bool(ReservationRepository(session).active_for_item(listing.inventory_item_id))
+            reserved = bool(
+                ReservationRepository(session).active_for_item(listing.inventory_item_id)
+            )
             anchor = _aware(listing.published_at) or _aware(listing.created_at)
             days_listed = (utc_now() - anchor).days
             hours_since = (
                 (utc_now() - _aware(listing.refreshed_at)).total_seconds() / 3600
-                if listing.refreshed_at else 999.0
+                if listing.refreshed_at
+                else 999.0
             )
-            min_price = item.acquisition_cost + self._marketplace.pricing.minimum_net_profit if item else current_price
+            min_price = (
+                item.acquisition_cost + self._marketplace.pricing.minimum_net_profit
+                if item
+                else current_price
+            )
             session.expunge(listing)
         if reserved:
             return {"decision": "hold", "reason": "reserved"}
         outcome = P.evaluate_markdown(
             P.MarkdownInputs(
-                current_price=current_price, minimum_price=_money(min_price),
-                days_listed=days_listed, hours_since_last_change=hours_since,
+                current_price=current_price,
+                minimum_price=_money(min_price),
+                days_listed=days_listed,
+                hours_since_last_change=hours_since,
                 total_reduction_percent=0.0,
             ),
             self._marketplace.pricing,
         )
         with self._session_factory() as session:
             PolicyDecisionRepository(session).record(
-                policy_type="pricing", policy_version=outcome.policy_version,
-                decision=outcome.decision, inputs={"current": str(current_price)},
-                reasons=outcome.reasons, resource_type="remote_listing", resource_id=listing_id,
+                policy_type="pricing",
+                policy_version=outcome.policy_version,
+                decision=outcome.decision,
+                inputs={"current": str(current_price)},
+                reasons=outcome.reasons,
+                resource_type="remote_listing",
+                resource_id=listing_id,
             )
             session.commit()
         if outcome.decision != "markdown":
             return {"decision": outcome.decision, "new_price": outcome.data.get("new_price")}
         new_price = Decimal(outcome.data["new_price"])
-        idem = hashlib.sha256(
-            f"price:{listing_id}:{new_price}".encode()
-        ).hexdigest()[:32]
+        idem = hashlib.sha256(f"price:{listing_id}:{new_price}".encode()).hexdigest()[:32]
         receipt = await self._gateway.execute(
             account_id=account_id,
             operation="update_listing",
@@ -1153,11 +1380,15 @@ class MarketplaceService:
         if receipt.ok:
             with self._session_factory() as session:
                 RemoteListingRepository(session).set_status(
-                    listing_id, status=RemoteListingStatus.ACTIVE,
-                    verified_action="update", price=new_price,
+                    listing_id,
+                    status=RemoteListingStatus.ACTIVE,
+                    verified_action="update",
+                    price=new_price,
                 )
                 session.commit()
-            self._audit("price.changed", "remote_listing", listing_id, {"new_price": str(new_price)})
+            self._audit(
+                "price.changed", "remote_listing", listing_id, {"new_price": str(new_price)}
+            )
         return {"decision": "markdown", "new_price": str(new_price), "ok": receipt.ok}
 
     async def relist_listing(
@@ -1182,9 +1413,7 @@ class MarketplaceService:
             relist_count = old.relist_count + 1
             title, description = item.title, item.description or ""
             currency = account.currency
-        ended = await self._end_listing(
-            listing_id, principal_scopes=principal_scopes, actor=actor
-        )
+        ended = await self._end_listing(listing_id, principal_scopes=principal_scopes, actor=actor)
         if not ended.ok or not ended.verified:
             return {"ok": False, "reason": "old listing could not be verified ended"}
         idem = hashlib.sha256(
@@ -1240,11 +1469,15 @@ class MarketplaceService:
                 )
             session.commit()
         if receipt.ok:
-            self._audit("relist.executed", "remote_listing", replacement_id, {"count": relist_count})
+            self._audit(
+                "relist.executed", "remote_listing", replacement_id, {"count": relist_count}
+            )
         return {"ok": receipt.ok, "listing_id": str(replacement_id)}
 
     # ------------------------------------------------------------- shipping
-    async def purchase_label(self, task_id: UUID, *, principal_scopes=None, actor="system:shipping"):
+    async def purchase_label(
+        self, task_id: UUID, *, principal_scopes=None, actor="system:shipping"
+    ):
         rules = self._marketplace.shipping
         with self._session_factory() as session:
             task = ShippingTaskRepository(session).get(task_id)
@@ -1275,9 +1508,7 @@ class MarketplaceService:
             and Decimal(str(dimensions[key])) > 0
             for key in ("length", "width", "height")
         ):
-            return await self._shipping_block(
-                task_id, "positive package dimensions are required"
-            )
+            return await self._shipping_block(task_id, "positive package dimensions are required")
         confirmed_threshold_grams = Decimal(str(rules.require_confirmed_weight_above)) * Decimal(
             "453.59237"
         )
@@ -1285,8 +1516,11 @@ class MarketplaceService:
             return {"ok": False, "reason": "confirmed packed weight required"}
         idem = self._idem("label", task_id, account_id)
         request = LabelRequest(
-            remote_order_id=remote_order_id, package_profile=profile,
-            weight_grams=weight, maximum_cost=rules.maximum_label_cost, idempotency_key=idem,
+            remote_order_id=remote_order_id,
+            package_profile=profile,
+            weight_grams=weight,
+            maximum_cost=rules.maximum_label_cost,
+            idempotency_key=idem,
         )
         receipt = await self._gateway.execute(
             account_id=account_id,
@@ -1307,13 +1541,16 @@ class MarketplaceService:
                 ExceptionTaskRepository(session).create(
                     exception_type="label_cost_exceeded",
                     reason=f"label cost {cost} exceeds ceiling {rules.maximum_label_cost}",
-                    severity="high", resource_type="shipping_task", resource_id=task_id,
+                    severity="high",
+                    resource_type="shipping_task",
+                    resource_id=task_id,
                 )
                 session.commit()
             return {"ok": False, "reason": "label cost exceeds ceiling", "cost": str(cost)}
         with self._session_factory() as session:
             ShippingTaskRepository(session).update(
-                task_id, expected_version=version,
+                task_id,
+                expected_version=version,
                 status=ShippingTaskStatus.LABEL_PURCHASED,
                 label_cost=cost,
                 label_reference=receipt.data.get("label_reference"),
@@ -1391,7 +1628,8 @@ class MarketplaceService:
                 raise RecordNotFoundError(f"order not found: {order_id}")
             item = (
                 InventoryRepository(session).get(order.inventory_item_id)
-                if order.inventory_item_id else None
+                if order.inventory_item_id
+                else None
             )
             item_cost = item.acquisition_cost if item else Decimal(0)
             shipping_task = None
@@ -1400,7 +1638,9 @@ class MarketplaceService:
                     shipping_task = task
                     break
             shipping_expense = (
-                shipping_task.label_cost if shipping_task and shipping_task.label_cost else Decimal(0)
+                shipping_task.label_cost
+                if shipping_task and shipping_task.label_cost
+                else Decimal(0)
             )
             gross = order.sale_price
             fees = order.marketplace_fees
@@ -1419,14 +1659,20 @@ class MarketplaceService:
             discrepancies: list[str] = []
             if fees == 0 and gross > 0:
                 discrepancies.append("missing_marketplace_fees")
-            if shipping_task is not None and shipping_expense == 0 and shipping_task.label_reference:
+            if (
+                shipping_task is not None
+                and shipping_expense == 0
+                and shipping_task.label_reference
+            ):
                 discrepancies.append("unexpected_missing_shipping_cost")
             if refund > gross:
                 discrepancies.append("refund_exceeds_sale")
 
             status = (
-                ReconciliationStatus.DISCREPANCY if discrepancies
-                else ReconciliationStatus.FINAL if final
+                ReconciliationStatus.DISCREPANCY
+                if discrepancies
+                else ReconciliationStatus.FINAL
+                if final
                 else ReconciliationStatus.PRELIMINARY
             )
             record = ReconciliationRepository(session).create(
@@ -1450,17 +1696,24 @@ class MarketplaceService:
             if discrepancies:
                 ExceptionTaskRepository(session).create(
                     exception_type="reconciliation_discrepancy",
-                    reason="; ".join(discrepancies), resource_type="marketplace_order",
+                    reason="; ".join(discrepancies),
+                    resource_type="marketplace_order",
                     resource_id=order_id,
                 )
                 AuditEventRepository(session).append(
-                    event_type="discrepancy.detected", actor_type="system", actor_id="reconciler",
-                    resource_type="marketplace_order", resource_id=order_id,
+                    event_type="discrepancy.detected",
+                    actor_type="system",
+                    actor_id="reconciler",
+                    resource_type="marketplace_order",
+                    resource_id=order_id,
                     details={"discrepancies": discrepancies},
                 )
             AuditEventRepository(session).append(
-                event_type="reconciliation.completed", actor_type="system", actor_id="reconciler",
-                resource_type="marketplace_order", resource_id=order_id,
+                event_type="reconciliation.completed",
+                actor_type="system",
+                actor_id="reconciler",
+                resource_type="marketplace_order",
+                resource_id=order_id,
                 details={"net_proceeds": str(net), "profit": str(profit)},
             )
             session.commit()
@@ -1514,7 +1767,9 @@ class MarketplaceService:
 
     def list_shipping_tasks(self, *, status=None, limit=100, offset=0):
         with self._session_factory() as session:
-            tasks = list(ShippingTaskRepository(session).list(status=status, limit=limit, offset=offset))
+            tasks = list(
+                ShippingTaskRepository(session).list(status=status, limit=limit, offset=offset)
+            )
             for task in tasks:
                 session.expunge(task)
             return tasks
@@ -1537,8 +1792,12 @@ class MarketplaceService:
         with self._session_factory() as session:
             breaker = CircuitBreakerRepository(session).reset(breaker_id)
             AuditEventRepository(session).append(
-                event_type="breaker.reset", actor_type="human", actor_id="operator",
-                resource_type="circuit_breaker", resource_id=breaker_id, details={},
+                event_type="breaker.reset",
+                actor_type="human",
+                actor_id="operator",
+                resource_type="circuit_breaker",
+                resource_id=breaker_id,
+                details={},
             )
             session.commit()
             session.refresh(breaker)

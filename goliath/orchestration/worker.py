@@ -39,7 +39,6 @@ class WorkerDaemon:
         self.config = config
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self.marketplace_worker = marketplace_worker
-        self._marketplace_tick_running = False
         self._stop = asyncio.Event()
         self._draining = False
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -70,14 +69,6 @@ class WorkerDaemon:
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             while not self._draining:
-                if self.marketplace_worker is not None and not self._marketplace_tick_running:
-                    self._marketplace_tick_running = True
-                    try:
-                        await self.marketplace_worker.run_once()
-                    except Exception:
-                        logger.exception("marketplace_maintenance_failed")
-                    finally:
-                        self._marketplace_tick_running = False
                 self._tasks = {task for task in self._tasks if not task.done()}
                 while len(self._tasks) < self.config.worker_concurrency and not self._draining:
                     task = await self._claim_task()
@@ -131,44 +122,95 @@ class WorkerDaemon:
         job_id, lease_identifier, token, agent_name = claimed
         with self.session_factory() as session:
             record = AgentJobRepository(session).get(job_id)
-            if record is None or agent_name is None:
+            if record is None:
                 return
-            request = ExecutionRequest(
-                job_id=record.id,
-                agent=agent_name,
-                task_type=record.task_type,
-                objective=record.objective,
-                workspace=record.workspace_path,
-                permissions=set(record.permissions),
-                context_files=record.context_files,
-                forbidden_actions=set(record.forbidden_actions),
-                timeout_seconds=record.timeout_seconds,
-                max_output_chars=record.max_output_chars,
-                metadata=record.job_metadata,
-            )
-        adapter = self.registry.get(agent_name)
-        if adapter is None:
+            metadata = dict(record.job_metadata or {})
+            is_marketplace = record.task_type == "marketplace_operation"
+            request = None
+            if not is_marketplace and agent_name is not None:
+                request = ExecutionRequest(
+                    job_id=record.id,
+                    agent=agent_name,
+                    task_type=record.task_type,
+                    objective=record.objective,
+                    workspace=record.workspace_path,
+                    permissions=set(record.permissions),
+                    context_files=record.context_files,
+                    forbidden_actions=set(record.forbidden_actions),
+                    timeout_seconds=record.timeout_seconds,
+                    max_output_chars=record.max_output_chars,
+                    metadata=metadata,
+                )
+        heartbeat = asyncio.create_task(self._lease_heartbeat(job_id, token))
+        if is_marketplace:
+            if self.marketplace_worker is None:
+                result = ExecutionResult(
+                    job_id=job_id,
+                    agent="marketplace-automation",
+                    duration_seconds=0,
+                    failure_reason="adapter failure: marketplace worker is not configured",
+                )
+            else:
+                try:
+                    outcome = await self.marketplace_worker.execute_job(metadata, job_id=job_id)
+                    failed = outcome.get("status") == "failed"
+                    result = ExecutionResult(
+                        job_id=job_id,
+                        agent="marketplace-automation",
+                        duration_seconds=0,
+                        exit_code=1 if failed else 0,
+                        structured_result=outcome,
+                        failure_reason=(
+                            f"adapter failure: {outcome.get('reason') or 'marketplace operation failed'}"
+                            if failed
+                            else None
+                        ),
+                    )
+                except Exception as error:  # noqa: BLE001 - durable retry boundary
+                    result = ExecutionResult(
+                        job_id=job_id,
+                        agent="marketplace-automation",
+                        duration_seconds=0,
+                        failure_reason=f"adapter failure: {type(error).__name__}: {error}",
+                    )
+        elif request is None or agent_name is None:
             result = ExecutionResult(
                 job_id=job_id,
-                agent=agent_name,
+                agent=agent_name or "unassigned",
                 duration_seconds=0,
                 failure_reason="selected agent unavailable",
             )
         else:
-            heartbeat = asyncio.create_task(self._lease_heartbeat(job_id, token))
-            try:
-                result = await adapter.run(request, on_started=lambda pid: self._set_pid(job_id, pid))
-            except Exception as error:  # noqa: BLE001
-                result = ExecutionResult(job_id=job_id, agent=agent_name, duration_seconds=0, failure_reason=f"adapter failure: {error}")
-            finally:
-                heartbeat.cancel()
+            adapter = self.registry.get(agent_name)
+            if adapter is None:
+                result = ExecutionResult(
+                    job_id=job_id,
+                    agent=agent_name,
+                    duration_seconds=0,
+                    failure_reason="selected agent unavailable",
+                )
+            else:
+                try:
+                    result = await adapter.run(
+                        request, on_started=lambda pid: self._set_pid(job_id, pid)
+                    )
+                except Exception as error:  # noqa: BLE001
+                    result = ExecutionResult(
+                        job_id=job_id,
+                        agent=agent_name,
+                        duration_seconds=0,
+                        failure_reason=f"adapter failure: {error}",
+                    )
+        heartbeat.cancel()
         self._complete(job_id, lease_identifier, token, result)
 
     async def _lease_heartbeat(self, job_id, token: str) -> None:
         while True:
             await asyncio.sleep(self.config.heartbeat_interval_seconds)
             with self.session_factory() as session:
-                LeaseRepository(session).heartbeat(job_id, self.worker_id, token, self.config.lease_duration_seconds)
+                LeaseRepository(session).heartbeat(
+                    job_id, self.worker_id, token, self.config.lease_duration_seconds
+                )
                 session.commit()
 
     def _set_pid(self, job_id, pid: int) -> None:

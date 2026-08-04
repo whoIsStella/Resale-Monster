@@ -25,6 +25,7 @@ from goliath.marketplace.broker import SessionBroker
 from goliath.marketplace.cipher import SessionCipher
 from goliath.marketplace.fake_adapter import FakeMarketplaceAdapter
 from goliath.marketplace.service import MarketplaceService
+from goliath.orchestration.scheduler import SchedulerService
 from goliath.orchestration.service import JobOrchestrationService
 from goliath.orchestration.uow import SqlAlchemyJobUnitOfWork
 from tests.test_orchestration import FakeAdapter
@@ -57,19 +58,21 @@ def stack():
         _, _, reader = AuthRepository(session).create_key("reader", ["marketplace:read"])
         session.commit()
     broker = SessionBroker(
-        session_factory=factory, config=config,
+        session_factory=factory,
+        config=config,
         adapter_factory=lambda p: FakeMarketplaceAdapter(marketplace=p.marketplace),
     )
-    marketplace_service = MarketplaceService(
-        session_factory=factory, config=config, broker=broker
-    )
+    marketplace_service = MarketplaceService(session_factory=factory, config=config, broker=broker)
     registry = AgentRegistry()
     registry.register("fake", FakeAdapter())
     orchestration = JobOrchestrationService(
         uow_factory=lambda: SqlAlchemyJobUnitOfWork(factory), registry=registry, config=config
     )
     app = create_app(
-        service=orchestration, registry=registry, session_factory=factory, config=config,
+        service=orchestration,
+        registry=registry,
+        session_factory=factory,
+        config=config,
         marketplace_service=marketplace_service,
     )
     with TestClient(app) as test_client:
@@ -113,11 +116,14 @@ def test_marketplace_read_scope_separation(stack) -> None:
     api, _admin, reader, *_ = stack
     # reader has marketplace:read but not admin: can list, cannot create.
     assert api.get("/marketplace-listings", headers=_h(reader)).status_code == 200
-    assert api.post(
-        "/marketplace-accounts",
-        json={"marketplace": "ebay", "label": "x", "capabilities": []},
-        headers=_h(reader),
-    ).status_code == 403
+    assert (
+        api.post(
+            "/marketplace-accounts",
+            json={"marketplace": "ebay", "label": "x", "capabilities": []},
+            headers=_h(reader),
+        ).status_code
+        == 403
+    )
 
 
 def test_circuit_breaker_endpoints(stack) -> None:
@@ -156,3 +162,63 @@ def test_cli_expected_error_no_traceback(stack, monkeypatch) -> None:
     result = runner.invoke(cli.app, ["breaker", "reset", str(uuid4())])
     assert result.exit_code == 1
     assert "Traceback" not in result.output
+
+
+def test_marketplace_schedules_use_generic_authorized_api(stack) -> None:
+    api, admin, reader, factory, config, marketplace_service = stack
+    account = marketplace_service.create_account(marketplace="ebay", label="scheduled")
+    scheduler = SchedulerService(
+        uow_factory=lambda: SqlAlchemyJobUnitOfWork(factory),
+        orchestration_service=None,
+        config=config,
+    )
+    installed = scheduler.install_marketplace_schedules(account_ids={account.id})
+    schedule_id = installed["schedule_ids"][0]
+    assert api.get("/schedules", headers=_h(reader)).status_code == 403
+    listed = api.get("/schedules", headers=_h(admin))
+    assert listed.status_code == 200
+    assert any(row["id"] == schedule_id for row in listed.json())
+    run = api.post(f"/schedules/{schedule_id}/run-now", headers=_h(admin))
+    assert run.status_code == 200
+    job_id = run.json()["id"]
+    visible = api.get(f"/jobs/{job_id}", headers=_h(admin))
+    assert visible.status_code == 200
+    assert visible.json()["metadata"]["schedule_id"] == schedule_id
+
+
+def test_marketplace_schedule_cli_lifecycle(stack, monkeypatch) -> None:
+    _api, _admin, _reader, factory, config, marketplace_service = stack
+    account = marketplace_service.create_account(marketplace="ebay", label="cli-scheduled")
+    scheduler = SchedulerService(
+        uow_factory=lambda: SqlAlchemyJobUnitOfWork(factory),
+        orchestration_service=None,
+        config=config,
+    )
+    monkeypatch.setattr(cli, "_marketplace_scheduler", lambda: scheduler)
+    monkeypatch.setattr(cli, "create_production_engine", lambda: factory.kw["bind"])
+
+    installed = runner.invoke(
+        cli.app,
+        ["marketplace", "schedules-install", "--account-id", str(account.id), "--json"],
+    )
+    assert installed.exit_code == 0, installed.output
+    installation = json.loads(installed.output)
+    assert installation["created"] == 21
+    duplicate = runner.invoke(
+        cli.app,
+        ["marketplace", "schedules-install", "--account-id", str(account.id), "--json"],
+    )
+    assert json.loads(duplicate.output)["existing"] == 21
+
+    listed = runner.invoke(
+        cli.app,
+        ["marketplace", "schedules-list", "--account-id", str(account.id), "--json"],
+    )
+    schedule_id = json.loads(listed.output)[0]["id"]
+    disabled = runner.invoke(cli.app, ["marketplace", "schedules-disable", schedule_id, "--json"])
+    assert json.loads(disabled.output)["enabled"] is False
+    enabled = runner.invoke(cli.app, ["marketplace", "schedules-enable", schedule_id, "--json"])
+    assert json.loads(enabled.output)["enabled"] is True
+    run = runner.invoke(cli.app, ["marketplace", "schedules-run-now", schedule_id, "--json"])
+    assert run.exit_code == 0
+    assert json.loads(run.output)["job_id"] is not None

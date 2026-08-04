@@ -1,0 +1,390 @@
+Finish Milestone Six for the Resale Monster repository.
+
+The API authorization, dependency compatibility, migrations, marketplace safety remediation, and full test suite are currently passing:
+
+* 223 tests passed
+* Ruff passed
+* API authorization is enforced across 89 protected routes
+* FastAPI TestClient works with `httpx2`
+* SQLite migration cycle passed
+* PostgreSQL offline upgrade and downgrade SQL generation passed
+* Model and migration table parity is 56/56
+
+Do not modify completed features unless required to integrate the remaining scheduler work.
+
+## Remaining acceptance blocker
+
+Marketplace maintenance is connected to the worker entry point, but durable scheduler-level marketplace job registration is incomplete.
+
+Complete this using the existing scheduler, job repository, worker daemon, leases, retries, recovery, audit, idempotency, emergency-stop, and circuit-breaker systems.
+
+Do not create a second scheduler or worker framework.
+
+## Required durable scheduled workflows
+
+Register persisted schedules and durable jobs for:
+
+1. Marketplace account synchronization
+2. Listing-state synchronization
+3. Listing reconciliation
+4. Order synchronization
+5. Paid-sale detection
+6. Inventory reservation
+7. Cross-marketplace delisting after a sale
+8. Offer synchronization
+9. Offer policy evaluation and execution
+10. Buyer-message synchronization
+11. Routine buyer-message response
+12. Price automation
+13. Listing refresh
+14. Listing share or promotion where supported
+15. Stale-inventory evaluation
+16. Shipping-task generation
+17. Eligible shipping-label purchase
+18. Tracking synchronization
+19. Financial reconciliation
+20. Expired reservation release
+21. Circuit-breaker half-open probes
+
+## Architecture requirements
+
+Each scheduled workflow must:
+
+* create a normal persisted job
+* run through the existing durable worker
+* use the existing lease and heartbeat mechanisms
+* use retry and backoff policies
+* support crash recovery
+* carry an idempotency key
+* produce audit events
+* appear in the existing jobs API and CLI
+* respect marketplace-account boundaries
+* respect emergency stops
+* respect account-level and operation-level circuit breakers
+* return controlled skipped results for unsupported adapter capabilities
+
+Do not execute marketplace operations directly inside the scheduler.
+
+The scheduler should only create durable jobs. The worker must claim and execute them.
+
+## Job payload requirements
+
+Every marketplace job must include, where applicable:
+
+* marketplace account ID
+* marketplace name
+* operation type
+* scheduled timestamp
+* schedule ID
+* policy version
+* idempotency key
+* retry configuration
+* correlation or trace ID
+* requested capability
+* write/read classification
+
+Persist these values in existing job metadata or typed schemas. Do not place raw cookies, tokens, browser state, buyer-private payloads, or secrets in job records.
+
+## Idempotency requirements
+
+Duplicate scheduler ticks must not create duplicate jobs.
+
+Use a deterministic idempotency key based on values such as:
+
+* schedule ID
+* operation type
+* marketplace account ID
+* normalized scheduled time window
+
+A repeated tick for the same account, operation, and schedule window must resolve to the existing job.
+
+Retries of an existing job must reuse the same operation idempotency key.
+
+Write operations must continue using gateway-level idempotency and read-back verification.
+
+## Emergency-stop behavior
+
+When a global, account-level, or operation-level emergency stop is active:
+
+* marketplace write jobs must not execute
+* blocked jobs must record a controlled blocked or skipped result
+* no adapter write method may be called
+* safe read-only synchronization and reconciliation jobs may continue
+* stop decisions must be auditable
+* lifting a stop must not cause duplicate writes
+
+Classify every scheduled operation explicitly as read-only or write-capable.
+
+## Circuit-breaker behavior
+
+Circuit breakers must isolate failures by marketplace account and operation.
+
+Requirements:
+
+* one failing account must not block unrelated accounts
+* one failing operation must not block unrelated operations
+* open breakers prevent affected write execution
+* half-open probes run through persisted jobs
+* successful probes close breakers
+* failed probes reopen breakers with backoff
+* breaker decisions are audited
+
+## Unsupported adapter behavior
+
+The current browser marketplace adapters are intentionally unsupported or read-only skeletons.
+
+For unsupported capabilities:
+
+* do not guess behavior
+* do not attempt browser fallback outside the typed adapter
+* do not report success
+* produce a controlled skipped or unsupported result
+* preserve the job record and audit event
+* do not repeatedly retry permanent unsupported-capability results
+
+Fake adapters must support deterministic tests for all required workflows.
+
+## Scheduler configuration
+
+Add typed, validated configuration for:
+
+* account sync interval
+* listing sync interval
+* listing reconciliation interval
+* order sync interval
+* offer sync interval
+* message sync interval
+* pricing interval
+* refresh interval
+* promotion/share interval
+* stale inventory interval
+* shipping interval
+* tracking interval
+* financial reconciliation interval
+* reservation cleanup interval
+* circuit-breaker probe interval
+
+Requirements:
+
+* intervals must be positive
+* intervals must have reasonable minimum and maximum bounds
+* invalid values must fail configuration validation
+* schedules must be independently enabled or disabled
+* account-specific overrides may be supported through existing configuration patterns
+* defaults must be safe for development and testing
+
+Update the example marketplace configuration.
+
+## Schedule installation and lifecycle
+
+Implement idempotent schedule installation.
+
+Repeated installation must not create duplicate schedules.
+
+Support:
+
+* install default marketplace schedules
+* list schedules
+* enable schedules
+* disable schedules
+* run a schedule immediately
+* inspect the last run and next run
+* inspect the most recently created job
+
+Use the existing schedule repository and scheduler service where possible.
+
+## CLI requirements
+
+Add or complete commands equivalent to:
+
+```text
+goliath marketplace schedules-list
+goliath marketplace schedules-install
+goliath marketplace schedules-enable
+goliath marketplace schedules-disable
+goliath marketplace schedules-run-now
+```
+
+Requirements:
+
+* JSON output support
+* clear non-zero exit codes on failure
+* idempotent installation
+* account and operation filters where useful
+* no secrets in output
+* useful reporting of created, existing, skipped, or disabled schedules
+
+Do not create a separate marketplace scheduler executable unless the existing architecture requires a thin entry-point wrapper.
+
+## API requirements
+
+Expose marketplace schedules and resulting jobs through existing scheduler and job APIs.
+
+Confirm that:
+
+* schedule endpoints require the existing schedule scopes
+* job endpoints retain existing job scopes
+* marketplace write schedule controls require appropriate administrative or schedule-write authorization
+* API output does not expose secrets or raw adapter payloads
+* scheduled jobs can be inspected through the standard job API
+
+Avoid duplicate marketplace-only job APIs when the generic job API already provides the required visibility.
+
+## Worker integration
+
+The production worker command must:
+
+* claim scheduler-created marketplace jobs
+* route them to the existing marketplace automation worker or handler
+* maintain leases and heartbeats
+* record success, failure, skipped, blocked, and retry outcomes
+* recover abandoned jobs
+* avoid executing duplicate jobs
+* shut down cleanly
+
+Remove or minimize opportunistic marketplace maintenance calls inside `WorkerDaemon` if they duplicate scheduler-created work.
+
+There must be one clear durable execution path.
+
+## Required tests
+
+Add deterministic tests for:
+
+1. Default schedule installation
+2. Duplicate installation prevention
+3. Schedule enable and disable
+4. Scheduler tick creating persisted jobs
+5. Duplicate tick idempotency
+6. Different time windows creating distinct jobs
+7. Different accounts creating distinct jobs
+8. Durable worker claim and execution
+9. Lease heartbeat behavior
+10. Lease-expiry recovery
+11. Retry and backoff behavior
+12. Permanent unsupported-capability skipping
+13. Emergency-stop write blocking
+14. Safe read jobs continuing during emergency stop
+15. Account-level stop isolation
+16. Operation-level stop isolation
+17. Account circuit-breaker isolation
+18. Operation circuit-breaker isolation
+19. Half-open probe success
+20. Half-open probe failure
+21. Scheduled order synchronization
+22. Scheduled paid-sale detection
+23. Scheduled inventory reservation
+24. Scheduled automatic cross-marketplace delisting
+25. Scheduled offer processing
+26. Scheduled message processing
+27. Scheduled price automation
+28. Scheduled listing refresh
+29. Scheduled sharing or promotion
+30. Scheduled stale-inventory evaluation
+31. Scheduled shipping-task generation
+32. Shipping-label validation
+33. Scheduled tracking synchronization
+34. Scheduled financial reconciliation
+35. Scheduled expired-reservation cleanup
+36. Job API visibility
+37. Schedule API authorization
+38. CLI JSON output
+39. CLI idempotent installation
+40. Audit events
+41. No raw secrets or buyer-private payloads in job metadata
+
+Tests must use:
+
+* fake adapters
+* fake clocks
+* deterministic IDs where needed
+* isolated SQLite databases
+* no network access
+* no live browser sessions
+* no real marketplace calls
+* no sleep-based timing tests
+
+## Migration requirements
+
+Create a migration only if the existing schedule and job tables cannot represent the required data.
+
+If a migration is needed:
+
+* preserve upgrade and downgrade support
+* verify SQLite migration behavior
+* generate PostgreSQL offline upgrade SQL
+* generate PostgreSQL offline downgrade SQL
+* maintain model and migration parity
+* do not use unrestricted SQL
+
+## Boundary review
+
+Verify:
+
+* no `shell=True`
+* no shell subprocess APIs
+* no arbitrary command execution
+* no raw cookie or browser-session exposure
+* no secrets in logs, jobs, API output, CLI output, or audit payloads
+* no direct marketplace calls outside typed adapters and gateway boundaries
+* no duplicate scheduler framework
+* no marketplace writes while stopped
+* no retry loops for permanent unsupported operations
+* no duplicate jobs from repeated scheduler ticks
+
+## Validation commands
+
+Run:
+
+```text
+python -m pytest -q
+python -m ruff check .
+git diff --check
+alembic upgrade head
+alembic check
+alembic downgrade base
+alembic upgrade head
+```
+
+Also generate and validate:
+
+```text
+alembic upgrade head --sql
+alembic downgrade base --sql
+```
+
+Use the repository’s PostgreSQL dialect configuration for offline SQL generation.
+
+Run targeted tests for the new scheduler behavior separately before the full suite.
+
+## Completion report
+
+At completion, report:
+
+1. Root cause of the missing durable scheduling.
+2. Architecture implemented.
+3. Schedule registration design.
+4. Scheduler-to-job-to-worker execution flow.
+5. Idempotency strategy.
+6. Emergency-stop behavior.
+7. Circuit-breaker behavior.
+8. Unsupported-capability behavior.
+9. CLI and API changes.
+10. Migration changes, if any.
+11. Exact tests added.
+12. Full test, lint, migration, and boundary-scan results.
+13. Changed-file list.
+14. Remaining limitations.
+15. Final verdict using exactly one of:
+
+    * `Milestone Six accepted`
+    * `Milestone Six incomplete and blocked`
+
+Do not declare Milestone Six accepted unless:
+
+* all required scheduler workflows are durably registered
+* duplicate ticks are proven idempotent
+* scheduler-created jobs execute through the durable worker
+* emergency stops and circuit breakers are proven by tests
+* the full test suite passes
+* Ruff passes
+* migration checks pass

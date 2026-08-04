@@ -67,6 +67,7 @@ class FakeMarketplaceAdapter(BaseMarketplaceAdapter):
         self._listings: dict[str, dict[str, Any]] = {}
         self._orders: dict[str, dict[str, Any]] = {}
         self._offers: dict[str, dict[str, Any]] = {}
+        self._messages: dict[str, dict[str, Any]] = {}
         self._labels: dict[str, dict[str, Any]] = {}
         self._sent_messages: dict[str, str] = {}
         self._counter = 0
@@ -95,6 +96,13 @@ class FakeMarketplaceAdapter(BaseMarketplaceAdapter):
 
     def seed_offer(self, remote_offer_id: str, **fields: Any) -> None:
         self._offers[remote_offer_id] = {"remote_offer_id": remote_offer_id, **fields}
+
+    def seed_message(self, remote_thread_id: str, body: str, **fields: Any) -> None:
+        self._messages[remote_thread_id] = {
+            "remote_thread_id": remote_thread_id,
+            "body": body,
+            **fields,
+        }
 
     # -- operations ------------------------------------------------------------
     async def health_check(self) -> OperationResult:
@@ -185,14 +193,20 @@ class FakeMarketplaceAdapter(BaseMarketplaceAdapter):
             return OperationResult.failure("refresh_listing", "not_found", remote_listing_id)
         listing["refreshed"] = True
         return OperationResult(
-            ok=True, operation="refresh_listing", data={"refreshed": True}, remote_id=remote_listing_id
+            ok=True,
+            operation="refresh_listing",
+            data={"refreshed": True},
+            remote_id=remote_listing_id,
         )
 
     async def promote_listing(self, remote_listing_id: str, **fields: Any) -> OperationResult:
         if (failure := self._maybe_fail("promote_listing")) is not None:
             return failure
         return OperationResult(
-            ok=True, operation="promote_listing", data={"promoted": True}, remote_id=remote_listing_id
+            ok=True,
+            operation="promote_listing",
+            data={"promoted": True},
+            remote_id=remote_listing_id,
         )
 
     async def share_listing(self, remote_listing_id: str) -> OperationResult:
@@ -209,7 +223,10 @@ class FakeMarketplaceAdapter(BaseMarketplaceAdapter):
         if listing is None:
             # Ending an unknown listing is treated as already inactive (safe).
             return OperationResult(
-                ok=True, operation="end_listing", data={"status": "ended"}, remote_id=remote_listing_id
+                ok=True,
+                operation="end_listing",
+                data={"status": "ended"},
+                remote_id=remote_listing_id,
             )
         listing["status"] = "ended"
         return OperationResult(
@@ -273,7 +290,11 @@ class FakeMarketplaceAdapter(BaseMarketplaceAdapter):
     async def read_messages(self) -> OperationResult:
         if (failure := self._maybe_fail("read_messages")) is not None:
             return failure
-        return OperationResult(ok=True, operation="read_messages", data={"messages": []})
+        return OperationResult(
+            ok=True,
+            operation="read_messages",
+            data={"messages": list(self._messages.values())},
+        )
 
     async def send_message(self, request: MessageRequest) -> OperationResult:
         if (failure := self._maybe_fail("send_message")) is not None:

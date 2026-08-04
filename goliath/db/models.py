@@ -516,6 +516,7 @@ class Schedule(Base):
     workspace_path: Mapped[str] = mapped_column(Text, nullable=False)
     permissions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     context_files: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    schedule_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     timing_type: Mapped[str] = mapped_column(String(20), nullable=False)
     timing_value: Mapped[str] = mapped_column(String(200), nullable=False)
     timezone: Mapped[str] = mapped_column(String(100), nullable=False, default="UTC")
@@ -524,6 +525,7 @@ class Schedule(Base):
     owner: Mapped[str] = mapped_column(String(200), nullable=False)
     enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
     last_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_job_id: Mapped[UUID | None] = mapped_column(Uuid)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
@@ -763,7 +765,9 @@ class ComparableSale(Base):
 
     __tablename__ = "comparable_sales"
     __table_args__ = (
-        UniqueConstraint("inventory_item_id", "marketplace", "source_identity", name="comp_identity"),
+        UniqueConstraint(
+            "inventory_item_id", "marketplace", "source_identity", name="comp_identity"
+        ),
         Index("ix_comparable_sales_item", "inventory_item_id"),
     )
 
@@ -1014,9 +1018,7 @@ class CategoryCompletenessRule(Base):
 
 class MarketplaceConstraintVersion(Base):
     __tablename__ = "marketplace_constraint_versions"
-    __table_args__ = (
-        UniqueConstraint("marketplace", "version", name="marketplace_version"),
-    )
+    __table_args__ = (UniqueConstraint("marketplace", "version", name="marketplace_version"),)
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     marketplace: Mapped[Marketplace] = mapped_column(
@@ -1690,9 +1692,7 @@ class MarketplaceOffer(Base):
 
 class MessageThread(Base):
     __tablename__ = "message_threads"
-    __table_args__ = (
-        UniqueConstraint("account_id", "remote_thread_id", name="thread_identity"),
-    )
+    __table_args__ = (UniqueConstraint("account_id", "remote_thread_id", name="thread_identity"),)
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     account_id: Mapped[UUID] = mapped_column(

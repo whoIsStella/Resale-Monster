@@ -196,6 +196,18 @@ goliath schedule disable SCHEDULE_ID
 goliath schedule tick
 ```
 
+Marketplace automation uses the same schedule, job, lease, retry, audit, and worker tables. Install
+the account-scoped schedules after provisioning marketplace accounts; repeated installation is safe.
+The scheduler only queues jobs, and `goliath worker start` is the sole production execution path.
+
+```bash
+goliath marketplace schedules-install --json
+goliath marketplace schedules-list --json
+goliath marketplace schedules-disable SCHEDULE_ID
+goliath marketplace schedules-enable SCHEDULE_ID
+goliath marketplace schedules-run-now SCHEDULE_ID --json
+```
+
 ## Authenticated API
 
 `goliath.api.create_app` builds the FastAPI orchestration application. `/health` is public;
@@ -209,8 +221,11 @@ routes with request IDs and OpenAPI documentation. Metrics remain disabled unles
 Use `goliath auth key-create`, `goliath auth key-list`, and `goliath auth key-revoke KEY_ID` for
 local key administration. No OAuth or external identity provider is used.
 
-Example systemd units for API, worker, and scheduler are provided under `systemd/`; they are
-examples only and are never installed automatically.
+Example systemd units for API and worker plus a scheduler oneshot/timer pair are provided under
+`systemd/`; they are examples only and are never installed automatically. Run marketplace schedule
+installation once after account provisioning, then enable both `goliath-worker.service` and
+`goliath-scheduler.timer`. The timer invokes only `schedule tick`; marketplace calls occur in jobs
+claimed by the durable worker.
 
 ## Milestone four: resale-domain operations
 

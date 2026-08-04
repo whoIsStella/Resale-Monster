@@ -196,7 +196,9 @@ class SessionReferenceRepository:
             )
         )
 
-    def get_active(self, account_id: UUID, *, now: datetime | None = None) -> SessionReference | None:
+    def get_active(
+        self, account_id: UUID, *, now: datetime | None = None
+    ) -> SessionReference | None:
         now = now or utc_now()
         reference = self._session.scalar(
             select(SessionReference)
@@ -260,7 +262,9 @@ class RemoteListingRepository:
             select(RemoteListing).where(RemoteListing.idempotency_key == idempotency_key)
         )
 
-    def find_active_on_account(self, inventory_item_id: UUID, account_id: UUID) -> RemoteListing | None:
+    def find_active_on_account(
+        self, inventory_item_id: UUID, account_id: UUID
+    ) -> RemoteListing | None:
         return self._session.scalar(
             select(RemoteListing).where(
                 RemoteListing.inventory_item_id == inventory_item_id,
@@ -613,6 +617,19 @@ class MessageRepository:
 
     def get_thread(self, thread_id: UUID) -> MessageThread | None:
         return self._session.get(MessageThread, thread_id)
+
+    def has_message_checksum(self, thread_id: UUID, checksum: str) -> bool:
+        return (
+            self._session.scalar(
+                select(MessageRecord.id)
+                .where(
+                    MessageRecord.thread_id == thread_id,
+                    MessageRecord.body_checksum == checksum,
+                )
+                .limit(1)
+            )
+            is not None
+        )
 
     def add_message(
         self,
@@ -1149,9 +1166,9 @@ class ExceptionTaskRepository:
     def count_open(self) -> int:
         return (
             self._session.scalar(
-                select(func.count()).select_from(ExceptionTask).where(
-                    ExceptionTask.status == ExceptionStatus.OPEN
-                )
+                select(func.count())
+                .select_from(ExceptionTask)
+                .where(ExceptionTask.status == ExceptionStatus.OPEN)
             )
             or 0
         )

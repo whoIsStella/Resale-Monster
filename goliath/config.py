@@ -150,9 +150,7 @@ class MediaConfig(BaseModel):
     allowed_mime_types: set[str] = Field(
         default_factory=lambda: {"image/jpeg", "image/png", "image/webp"}
     )
-    allowed_extensions: set[str] = Field(
-        default_factory=lambda: {".jpg", ".jpeg", ".png", ".webp"}
-    )
+    allowed_extensions: set[str] = Field(default_factory=lambda: {".jpg", ".jpeg", ".png", ".webp"})
     max_file_bytes: int = Field(default=25_000_000, ge=1, le=1_000_000_000)
     max_image_dimension: int = Field(default=12_000, ge=16, le=100_000)
     min_image_dimension: int = Field(default=200, ge=1, le=100_000)
@@ -179,9 +177,7 @@ class MediaConfig(BaseModel):
         for name_a, path_a in roots.items():
             for name_b, path_b in roots.items():
                 if name_a != name_b and path_a.is_relative_to(path_b):
-                    raise ValueError(
-                        f"{name_a} must not be nested inside {name_b}"
-                    )
+                    raise ValueError(f"{name_a} must not be nested inside {name_b}")
         if self.min_image_dimension >= self.max_image_dimension:
             raise ValueError("min_image_dimension must be below max_image_dimension")
         return self
@@ -294,9 +290,7 @@ class DomainConfig(BaseModel):
         }
     )
     proposal_expiration_seconds: int = Field(default=604_800, ge=60, le=31_536_000)
-    approval_risk_tiers: set[str] = Field(
-        default_factory=lambda: {"low", "medium", "high"}
-    )
+    approval_risk_tiers: set[str] = Field(default_factory=lambda: {"low", "medium", "high"})
     mcp_host: str = "127.0.0.1"
     mcp_transport: Literal["stdio", "http"] = "stdio"
     mcp_http_port: int = Field(default=8900, ge=1, le=65_535)
@@ -331,9 +325,7 @@ class DomainConfig(BaseModel):
     @model_validator(mode="after")
     def fee_version_exists(self) -> DomainConfig:
         if self.default_fee_version not in self.fee_versions:
-            raise ValueError(
-                f"default_fee_version not defined: {self.default_fee_version}"
-            )
+            raise ValueError(f"default_fee_version not defined: {self.default_fee_version}")
         if not self.approval_risk_tiers:
             raise ValueError("at least one approval risk tier is required")
         if (
@@ -352,7 +344,9 @@ class DomainConfig(BaseModel):
 
     def resolve_quarantine_path(self, candidate: Path) -> Path:
         root = self.media.quarantine_root.expanduser().resolve()
-        resolved = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+        resolved = (
+            (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+        )
         if not resolved.is_relative_to(root):
             raise ValueError(f"quarantine path is outside the configured root: {candidate}")
         return resolved
@@ -360,7 +354,9 @@ class DomainConfig(BaseModel):
     def resolve_media_path(self, candidate: Path) -> Path:
         """Reject media paths that escape the configured storage root."""
         root = self.media_storage_root.expanduser().resolve()
-        resolved = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+        resolved = (
+            (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+        )
         if not resolved.is_relative_to(root):
             raise ValueError(f"media path is outside the configured root: {candidate}")
         return resolved
@@ -522,6 +518,67 @@ class CircuitBreakerRules(BaseModel):
     half_open_probe_after_seconds: int = Field(default=300, ge=1, le=86_400)
 
 
+class MarketplaceScheduleSetting(BaseModel):
+    """One independently controllable durable marketplace schedule."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    interval_seconds: int = Field(ge=5, le=2_592_000)
+
+
+class MarketplaceScheduleConfig(BaseModel):
+    """Safe development defaults for the durable marketplace workflows."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    account_sync: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=300)
+    )
+    listing_sync: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=600)
+    )
+    listing_reconciliation: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=1800)
+    )
+    order_sync: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=300)
+    )
+    offer_sync: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=300)
+    )
+    message_sync: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=300)
+    )
+    pricing: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=21_600)
+    )
+    refresh: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=43_200)
+    )
+    promotion_share: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=10_800)
+    )
+    stale_inventory: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=86_400)
+    )
+    shipping: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=600)
+    )
+    tracking: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=900)
+    )
+    financial_reconciliation: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=3600)
+    )
+    reservation_cleanup: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=3600)
+    )
+    circuit_breaker_probe: MarketplaceScheduleSetting = Field(
+        default_factory=lambda: MarketplaceScheduleSetting(interval_seconds=300)
+    )
+
+
 class MarketplaceAccountConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -537,9 +594,7 @@ class MarketplaceAccountConfig(BaseModel):
     def domains_present(self) -> MarketplaceAccountConfig:
         from goliath.marketplace.adapter import MARKETPLACE_OPERATIONS
 
-        unknown = (set(self.capabilities) | set(self.operation_modes)) - set(
-            MARKETPLACE_OPERATIONS
-        )
+        unknown = (set(self.capabilities) | set(self.operation_modes)) - set(MARKETPLACE_OPERATIONS)
         if unknown:
             raise ValueError(f"unsupported marketplace operations: {', '.join(sorted(unknown))}")
         if not self.allowed_domains:
@@ -560,9 +615,7 @@ class MarketplaceAccountConfig(BaseModel):
                 normalized == expected or normalized.endswith("." + expected)
                 for expected in expected_domains
             ):
-                raise ValueError(
-                    f"domain {domain} is outside the {self.marketplace} allowlist"
-                )
+                raise ValueError(f"domain {domain} is outside the {self.marketplace} allowlist")
         return self
 
 
@@ -584,6 +637,7 @@ class MarketplaceAutomationConfig(BaseModel):
     shipping: ShippingRules = Field(default_factory=ShippingRules)
     refunds: RefundRules = Field(default_factory=RefundRules)
     circuit_breaker: CircuitBreakerRules = Field(default_factory=CircuitBreakerRules)
+    schedules: MarketplaceScheduleConfig = Field(default_factory=MarketplaceScheduleConfig)
     operation_rate_limit_per_minute: int = Field(default=60, ge=1, le=100_000)
     max_publish_per_hour: int = Field(default=100, ge=1, le=100_000)
     max_delisting_latency_seconds: int = Field(default=900, ge=1, le=86_400)
@@ -664,9 +718,7 @@ class OrchestrationConfig(BaseModel):
     workspace_roots: list[Path] = Field(min_length=1)
     agents: dict[str, AgentConfig] = Field(default_factory=dict)
     domain: DomainConfig = Field(default_factory=DomainConfig)
-    marketplace: MarketplaceAutomationConfig = Field(
-        default_factory=MarketplaceAutomationConfig
-    )
+    marketplace: MarketplaceAutomationConfig = Field(default_factory=MarketplaceAutomationConfig)
 
     @field_validator("workspace_roots")
     @classmethod
@@ -697,16 +749,12 @@ class OrchestrationConfig(BaseModel):
         session_root = self.marketplace.session.session_root.expanduser().resolve()
         for root in self.workspace_roots:
             if session_root == root or session_root.is_relative_to(root):
-                raise ValueError(
-                    "marketplace session root must be outside all agent workspaces"
-                )
+                raise ValueError("marketplace session root must be outside all agent workspaces")
         # General coding agents must not inherit marketplace scopes.
         marketplace_scopes = self.marketplace.marketplace_scopes
         for name, agent in self.agents.items():
             if agent.adapter == "codex" and set(agent.mcp_scopes) & marketplace_scopes:
-                raise ValueError(
-                    f"coding agent '{name}' must not hold marketplace scopes"
-                )
+                raise ValueError(f"coding agent '{name}' must not hold marketplace scopes")
         return self
 
     def validate_workspace(self, workspace: Path) -> Path:

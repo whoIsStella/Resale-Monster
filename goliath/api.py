@@ -441,14 +441,31 @@ def create_app(
             value = ScheduleRepository(session).get(schedule_id)
             if value is None:
                 raise HTTPException(status_code=404, detail="schedule not found")
-            submission = JobSubmission(
-                task_type=value.task_type,
-                objective=value.objective_template,
-                workspace=Path(value.workspace_path),
-                requested_agent=value.requested_agent,
-                permissions=set(value.permissions),
-                context_files=[Path(path) for path in value.context_files],
+            marketplace_schedule = value.task_type == "marketplace_operation"
+            submission = (
+                None
+                if marketplace_schedule
+                else JobSubmission(
+                    task_type=value.task_type,
+                    objective=value.objective_template,
+                    workspace=Path(value.workspace_path),
+                    requested_agent=value.requested_agent,
+                    permissions=set(value.permissions),
+                    context_files=[Path(path) for path in value.context_files],
+                )
             )
+        if marketplace_schedule:
+            from goliath.orchestration.scheduler import SchedulerService
+
+            scheduler = SchedulerService(
+                uow_factory=lambda: __import__(
+                    "goliath.orchestration.uow", fromlist=["SqlAlchemyJobUnitOfWork"]
+                ).SqlAlchemyJobUnitOfWork(session_factory),
+                orchestration_service=service,
+                config=config,
+            )
+            return scheduler.run_now(schedule_id)
+        assert submission is not None
         return await service.submit(submission)
 
     # ---------------------------------------------------------- domain routes

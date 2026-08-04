@@ -262,6 +262,7 @@ class JobResponse(BaseModel):
     stdout: str
     stderr: str
     structured_result: dict[str, Any] | None
+    metadata: dict[str, Any] = Field(validation_alias="job_metadata")
     failure_reason: str | None
     cancellation_reason: str | None
     output_truncated: bool

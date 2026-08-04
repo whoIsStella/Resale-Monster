@@ -666,7 +666,11 @@ def research_complete(
             research_id, actor="human:cli", status=ResearchStatus(status)
         )
         _emit_json(
-            {"id": str(record.id), "status": record.status.value, "proposal": str(proposal_id) if proposal_id else None},
+            {
+                "id": str(record.id),
+                "status": record.status.value,
+                "proposal": str(proposal_id) if proposal_id else None,
+            },
             json_output=json_output,
             human=f"{record.id} {record.status.value}",
         )
@@ -706,7 +710,11 @@ def listing_draft_create(
     try:
         draft = build_domain_service().create_master_draft(item_id, actor="human:cli")
         _emit_json(
-            {"id": str(draft.id), "status": draft.status.value, "warnings": draft.validation_warnings},
+            {
+                "id": str(draft.id),
+                "status": draft.status.value,
+                "warnings": draft.validation_warnings,
+            },
             json_output=json_output,
             human=str(draft.id),
         )
@@ -738,7 +746,11 @@ def listing_variant_create(
             draft_id, actor="human:cli", marketplace=Marketplace(marketplace)
         )
         _emit_json(
-            {"id": str(variant.id), "marketplace": variant.marketplace.value, "title": variant.marketplace_title},
+            {
+                "id": str(variant.id),
+                "marketplace": variant.marketplace.value,
+                "title": variant.marketplace_title,
+            },
             json_output=json_output,
             human=variant.marketplace_title,
         )
@@ -887,9 +899,7 @@ def media_ingest(
 
 
 @media_app.command("list")
-def media_list(
-    item_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False
-) -> None:
+def media_list(item_id: UUID, json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
     try:
         svc = build_domain_service()
         rows = [
@@ -1038,7 +1048,12 @@ def review_list(
         service = build_review_service()
         tasks = service.list_tasks(status=ReviewTaskStatus(status) if status else None)
         rows = [
-            {"id": str(t.id), "type": t.task_type.value, "status": t.status.value, "version": t.version}
+            {
+                "id": str(t.id),
+                "type": t.task_type.value,
+                "status": t.status.value,
+                "version": t.version,
+            }
             for t in tasks
         ]
         _emit_json(
@@ -1074,9 +1089,7 @@ def review_complete(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     try:
-        task = build_review_service().complete_task(
-            task_id, reviewer="human:cli", outcome=outcome
-        )
+        task = build_review_service().complete_task(task_id, reviewer="human:cli", outcome=outcome)
         _emit_json(
             {"id": str(task.id), "status": task.status.value},
             json_output=json_output,
@@ -1105,7 +1118,9 @@ def review_dismiss(
 def dashboard_summary(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
     try:
         summary = build_review_service().summary()
-        _emit_json(summary, json_output=json_output, human=json.dumps(summary, indent=2, default=str))
+        _emit_json(
+            summary, json_output=json_output, human=json.dumps(summary, indent=2, default=str)
+        )
     except (RuntimeError, ValueError, LookupError) as error:
         _fail(error)
 
@@ -1160,13 +1175,20 @@ def automation_start(
 def marketplace_account_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
     try:
         rows = [
-            {"id": str(a.id), "marketplace": a.marketplace.value, "mode": a.automation_mode.value, "status": a.status.value}
+            {
+                "id": str(a.id),
+                "marketplace": a.marketplace.value,
+                "mode": a.automation_mode.value,
+                "status": a.status.value,
+            }
             for a in build_marketplace_service().list_accounts()
         ]
         _emit_json(
             rows,
             json_output=json_output,
-            human="\n".join(f"{r['id']}  {r['marketplace']}  {r['mode']}  {r['status']}" for r in rows),
+            human="\n".join(
+                f"{r['id']}  {r['marketplace']}  {r['mode']}  {r['status']}" for r in rows
+            ),
         )
     except (RuntimeError, ValueError, LookupError) as error:
         _fail(error)
@@ -1217,6 +1239,142 @@ def marketplace_sync(
             build_marketplace_service().sync_orders(account_id, principal_scopes={"admin"})
         )
         _emit_json(result, json_output=json_output, human=json.dumps(result, default=str))
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+def _marketplace_scheduler():
+    runtime = build_runtime()
+    engine = create_production_engine()
+    from goliath.orchestration.scheduler import SchedulerService
+
+    return SchedulerService(
+        uow_factory=lambda: SqlAlchemyJobUnitOfWork(build_session_factory(engine)),
+        orchestration_service=runtime.service,
+        config=runtime.config,
+    )
+
+
+@marketplace_app.command("schedules-install")
+def marketplace_schedules_install(
+    account_id: Annotated[list[UUID] | None, typer.Option("--account-id")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        result = _marketplace_scheduler().install_marketplace_schedules(
+            account_ids=set(account_id) if account_id else None
+        )
+        _emit_json(
+            result,
+            json_output=json_output,
+            human=f"created={result['created']} existing={result['existing']}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@marketplace_app.command("schedules-list")
+def marketplace_schedules_list(
+    account_id: Annotated[UUID | None, typer.Option("--account-id")] = None,
+    operation: Annotated[str | None, typer.Option()] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        engine = create_production_engine()
+        with build_session_factory(engine)() as session:
+            from goliath.db.operations import ScheduleRepository
+
+            values = [
+                schedule
+                for schedule in ScheduleRepository(session).list()
+                if schedule.task_type == "marketplace_operation"
+                and (
+                    account_id is None
+                    or (schedule.schedule_metadata or {}).get("marketplace_account_id")
+                    == str(account_id)
+                )
+                and (
+                    operation is None
+                    or (schedule.schedule_metadata or {}).get("operation_type") == operation
+                )
+            ]
+        payload = [
+            {
+                "id": str(value.id),
+                "name": value.name,
+                "enabled": value.enabled,
+                "operation": value.schedule_metadata.get("operation_type"),
+                "account_id": value.schedule_metadata.get("marketplace_account_id"),
+                "last_run_at": value.last_scheduled_at,
+                "next_run_at": value.next_run_at,
+                "last_job_id": str(value.last_job_id) if value.last_job_id else None,
+            }
+            for value in values
+        ]
+        _emit_json(
+            payload,
+            json_output=json_output,
+            human="\n".join(
+                f"{row['id']}  {row['operation']}  {'enabled' if row['enabled'] else 'disabled'}"
+                for row in payload
+            ),
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+def _marketplace_schedule_enabled(schedule_id: UUID, enabled: bool, json_output: bool) -> None:
+    try:
+        engine = create_production_engine()
+        with build_session_factory(engine)() as session:
+            from goliath.db.operations import ScheduleRepository
+
+            schedule = ScheduleRepository(session).get(schedule_id)
+            if schedule is None or schedule.task_type != "marketplace_operation":
+                raise RecordNotFoundError(f"marketplace schedule not found: {schedule_id}")
+            schedule = ScheduleRepository(session).set_enabled(schedule_id, enabled)
+            session.commit()
+        _emit_json(
+            {"id": str(schedule.id), "enabled": schedule.enabled},
+            json_output=json_output,
+            human=f"{schedule.id} {'enabled' if enabled else 'disabled'}",
+        )
+    except (RuntimeError, ValueError, LookupError) as error:
+        _fail(error)
+
+
+@marketplace_app.command("schedules-enable")
+def marketplace_schedules_enable(
+    schedule_id: UUID,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    _marketplace_schedule_enabled(schedule_id, True, json_output)
+
+
+@marketplace_app.command("schedules-disable")
+def marketplace_schedules_disable(
+    schedule_id: UUID,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    _marketplace_schedule_enabled(schedule_id, False, json_output)
+
+
+@marketplace_app.command("schedules-run-now")
+def marketplace_schedules_run_now(
+    schedule_id: UUID,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        job = _marketplace_scheduler().run_now(schedule_id)
+        payload = {
+            "job_id": str(job.id) if job is not None else None,
+            "existing": job is None,
+        }
+        _emit_json(
+            payload,
+            json_output=json_output,
+            human=(str(job.id) if job is not None else "job already exists for this window"),
+        )
     except (RuntimeError, ValueError, LookupError) as error:
         _fail(error)
 
@@ -1296,7 +1454,11 @@ def order_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> 
             {"id": str(o.id), "status": o.status.value, "sale_price": str(o.sale_price)}
             for o in build_marketplace_service().list_orders()
         ]
-        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['status']}" for r in rows))
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['status']}" for r in rows),
+        )
     except (RuntimeError, ValueError, LookupError) as error:
         _fail(error)
 
@@ -1321,7 +1483,11 @@ def offer_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> 
             {"id": str(o.id), "status": o.status.value, "amount": str(o.offer_amount)}
             for o in build_marketplace_service().list_offers()
         ]
-        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['status']}" for r in rows))
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['status']}" for r in rows),
+        )
     except (RuntimeError, ValueError, LookupError) as error:
         _fail(error)
 
@@ -1337,7 +1503,11 @@ def message_list(json_output: Annotated[bool, typer.Option("--json")] = False) -
                 {"id": str(t.id), "escalated": t.escalated, "category": t.last_category}
                 for t in MessageRepository(session).list_threads()
             ]
-        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['category']}" for r in rows))
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['category']}" for r in rows),
+        )
     except (RuntimeError, ValueError, LookupError) as error:
         _fail(error)
 
@@ -1353,7 +1523,11 @@ def shipping_list(json_output: Annotated[bool, typer.Option("--json")] = False) 
                 {"id": str(t.id), "status": t.status.value, "profile": t.package_profile}
                 for t in ShippingTaskRepository(session).list()
             ]
-        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['status']}" for r in rows))
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['status']}" for r in rows),
+        )
     except (RuntimeError, ValueError, LookupError) as error:
         _fail(error)
 
@@ -1403,7 +1577,11 @@ def breaker_list(json_output: Annotated[bool, typer.Option("--json")] = False) -
             {"id": str(b.id), "scope": b.scope, "key": b.scope_key, "state": b.state.value}
             for b in build_marketplace_service().list_breakers()
         ]
-        _emit_json(rows, json_output=json_output, human="\n".join(f"{r['id']}  {r['scope']}  {r['state']}" for r in rows))
+        _emit_json(
+            rows,
+            json_output=json_output,
+            human="\n".join(f"{r['id']}  {r['scope']}  {r['state']}" for r in rows),
+        )
     except (RuntimeError, ValueError, LookupError) as error:
         _fail(error)
 

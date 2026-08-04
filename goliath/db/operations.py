@@ -256,6 +256,9 @@ class ScheduleRepository:
     def get(self, schedule_id: UUID) -> Schedule | None:
         return self.session.get(Schedule, schedule_id)
 
+    def get_by_name(self, name: str) -> Schedule | None:
+        return self.session.scalar(select(Schedule).where(Schedule.name == name))
+
     def list(self, enabled: bool | None = None) -> list[Schedule]:
         statement = select(Schedule).order_by(Schedule.name)
         if enabled is not None:

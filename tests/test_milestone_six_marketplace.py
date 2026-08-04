@@ -46,9 +46,22 @@ from goliath.marketplace.manual_adapter import ManualMarketplaceAdapter
 from goliath.marketplace.service import MarketplaceService
 
 CAPS = [
-    "create_listing", "read_listings", "read_listing", "update_listing", "end_listing",
-    "refresh_listing", "promote_listing", "read_orders", "read_order", "accept_offer",
-    "decline_offer", "counter_offer", "send_message", "purchase_label",
+    "create_listing",
+    "read_listings",
+    "read_listing",
+    "update_listing",
+    "end_listing",
+    "refresh_listing",
+    "promote_listing",
+    "read_orders",
+    "read_order",
+    "accept_offer",
+    "decline_offer",
+    "counter_offer",
+    "read_offers",
+    "read_messages",
+    "send_message",
+    "purchase_label",
 ]
 
 
@@ -83,8 +96,12 @@ def env():
     service = MarketplaceService(session_factory=factory, config=config, broker=broker)
     domain = DomainService(session_factory=factory, config=config)
     yield {
-        "factory": factory, "config": config, "service": service, "domain": domain,
-        "adapters": adapters, "broker": broker,
+        "factory": factory,
+        "config": config,
+        "service": service,
+        "domain": domain,
+        "adapters": adapters,
+        "broker": broker,
     }
     engine.dispose()
 
@@ -92,8 +109,13 @@ def env():
 def _ready_item(env, sku="S1"):
     domain = env["domain"]
     item = domain.create_inventory(
-        actor="human:op", sku=sku, title="Nike Tee", condition="good",
-        acquisition_cost=Decimal(10), category="clothing", status="ready_for_listing",
+        actor="human:op",
+        sku=sku,
+        title="Nike Tee",
+        condition="good",
+        acquisition_cost=Decimal(10),
+        category="clothing",
+        status="ready_for_listing",
     )
     draft = domain.create_master_draft(item.id, actor="agent:codex")
     with env["factory"]() as session:
@@ -102,14 +124,22 @@ def _ready_item(env, sku="S1"):
         )
         session.commit()
     domain.create_pricing_recommendation(
-        item.id, actor="human:op",
-        inputs=PricingInputs(cost_basis=Decimal(10), comparables=[
-            ComparableObservation(price=Decimal(40), is_sold=True)
-        ]),
+        item.id,
+        actor="human:op",
+        inputs=PricingInputs(
+            cost_basis=Decimal(10),
+            comparables=[ComparableObservation(price=Decimal(40), is_sold=True)],
+        ),
     )
     domain.add_media(
-        item.id, actor="human:op", media_type="image/jpeg", checksum="c1", file_size=100,
-        role=MediaRole.ORIGINAL, storage_path="a.jpg", file_identifier="f1",
+        item.id,
+        actor="human:op",
+        media_type="image/jpeg",
+        checksum="c1",
+        file_size=100,
+        role=MediaRole.ORIGINAL,
+        storage_path="a.jpg",
+        file_identifier="f1",
     )
     return item
 
@@ -194,9 +224,7 @@ def test_marketplace_domain_allowlist_rejects_cross_market_domain() -> None:
     from goliath.config import MarketplaceAccountConfig
 
     with pytest.raises(ValueError, match="outside the ebay allowlist"):
-        MarketplaceAccountConfig(
-            marketplace="ebay", label="main", allowed_domains=["facebook.com"]
-        )
+        MarketplaceAccountConfig(marketplace="ebay", label="main", allowed_domains=["facebook.com"])
 
 
 # --------------------------------------------------------------- automation mode
@@ -205,7 +233,9 @@ def test_marketplace_domain_allowlist_rejects_cross_market_domain() -> None:
 async def test_disabled_mode_blocks_writes(env) -> None:
     item = _ready_item(env)
     account = _account(env, "ebay", "ebay-main", mode="disabled")
-    result = await env["service"].publish_item(item.id, account_ids=[account.id], principal_scopes={"admin"})
+    result = await env["service"].publish_item(
+        item.id, account_ids=[account.id], principal_scopes={"admin"}
+    )
     assert result["results"]["ebay-main"] == "blocked"
 
 
@@ -230,7 +260,10 @@ async def test_publish_and_cross_post_with_verification(env) -> None:
     assert result["results"] == {"ebay-main": "published", "poshmark-main": "published"}
     listings = env["service"].list_listings()
     assert len(listings) == 2
-    assert all(x.status is RemoteListingStatus.ACTIVE and x.last_verified_action == "publish" for x in listings)
+    assert all(
+        x.status is RemoteListingStatus.ACTIVE and x.last_verified_action == "publish"
+        for x in listings
+    )
     assert env["domain"].get_inventory(item.id).status is InventoryStatus.LISTED
 
 
@@ -241,28 +274,53 @@ async def test_publish_is_idempotent_and_prevents_duplicates(env) -> None:
     second = await env["service"].publish_item(item.id, principal_scopes={"admin"})
     assert first["results"]["ebay-main"] == "published"
     assert second["results"]["ebay-main"] == "blocked"  # duplicate active listing
-    assert len([x for x in env["service"].list_listings() if x.status is RemoteListingStatus.ACTIVE]) == 1
+    assert (
+        len([x for x in env["service"].list_listings() if x.status is RemoteListingStatus.ACTIVE])
+        == 1
+    )
 
 
 async def test_publish_blocks_on_insufficient_profit(env) -> None:
     domain = env["domain"]
     item = domain.create_inventory(
-        actor="human:op", sku="P0", title="Tee", condition="good",
-        acquisition_cost=Decimal(100), category="clothing", status="ready_for_listing",
+        actor="human:op",
+        sku="P0",
+        title="Tee",
+        condition="good",
+        acquisition_cost=Decimal(100),
+        category="clothing",
+        status="ready_for_listing",
     )
     draft = domain.create_master_draft(item.id, actor="agent:codex")
     with env["factory"]() as session:
-        ListingDraftRepository(session).set_status(draft.id, status=DraftStatus.APPROVED, created_by="human:op")
+        ListingDraftRepository(session).set_status(
+            draft.id, status=DraftStatus.APPROVED, created_by="human:op"
+        )
         session.commit()
     # Pricing recommendation with negative/low profit.
     domain.create_pricing_recommendation(
-        item.id, actor="human:op",
-        inputs=PricingInputs(cost_basis=Decimal(100), comparables=[ComparableObservation(price=Decimal(101), is_sold=True)]),
+        item.id,
+        actor="human:op",
+        inputs=PricingInputs(
+            cost_basis=Decimal(100),
+            comparables=[ComparableObservation(price=Decimal(101), is_sold=True)],
+        ),
     )
-    domain.add_media(item.id, actor="human:op", media_type="image/jpeg", checksum="c9", file_size=1, role=MediaRole.ORIGINAL, storage_path="x.jpg", file_identifier="f9")
+    domain.add_media(
+        item.id,
+        actor="human:op",
+        media_type="image/jpeg",
+        checksum="c9",
+        file_size=1,
+        role=MediaRole.ORIGINAL,
+        storage_path="x.jpg",
+        file_identifier="f9",
+    )
     account = _account(env, "ebay", "ebay-main")
     env["config"].marketplace.publishing = PublishingRules(minimum_expected_profit=Decimal(50))
-    result = await env["service"].publish_item(item.id, account_ids=[account.id], principal_scopes={"admin"})
+    result = await env["service"].publish_item(
+        item.id, account_ids=[account.id], principal_scopes={"admin"}
+    )
     assert result["results"]["ebay-main"] == "blocked"
 
 
@@ -289,8 +347,13 @@ async def test_sale_detection_reserves_and_delists_everywhere(env) -> None:
     active = [x for x in env["service"].list_listings() if x.status is RemoteListingStatus.ACTIVE]
     assert len(active) == 2
     env["adapters"]["ebay"].seed_order(
-        "O-1", sale_price="40", status="paid", inventory_item_id=str(item.id),
-        remote_listing_id=active[0].remote_listing_id, buyer="b1", marketplace_fees="4.00",
+        "O-1",
+        sale_price="40",
+        status="paid",
+        inventory_item_id=str(item.id),
+        remote_listing_id=active[0].remote_listing_id,
+        buyer="b1",
+        marketplace_fees="4.00",
     )
     sync = await env["service"].sync_orders(a1.id, principal_scopes={"admin"})
     assert sync["orders_detected"] == 1
@@ -308,8 +371,12 @@ async def test_delisting_failure_opens_exception_and_breaker(env) -> None:
     # Make end_listing fail on the ebay adapter.
     env["adapters"]["ebay"]._fail_operations = {"end_listing"}
     env["adapters"]["ebay"].seed_order(
-        "O-2", sale_price="40", status="paid", inventory_item_id=str(item.id),
-        remote_listing_id=active[0].remote_listing_id, buyer="b2",
+        "O-2",
+        sale_price="40",
+        status="paid",
+        inventory_item_id=str(item.id),
+        remote_listing_id=active[0].remote_listing_id,
+        buyer="b2",
     )
     await env["service"].sync_orders(a1.id, principal_scopes={"admin"})
     from goliath.db.marketplace_repositories import ExceptionTaskRepository
@@ -327,8 +394,11 @@ async def test_offer_accept_and_min_profit(env) -> None:
     account = _account(env, "ebay", "ebay-main")
     with env["factory"]() as session:
         offer = MarketplaceOfferRepository(session).upsert(
-            account_id=account.id, remote_offer_id="OF-1",
-            offer_amount=Decimal(60), list_price=Decimal(80), inventory_item_id=item.id,
+            account_id=account.id,
+            remote_offer_id="OF-1",
+            offer_amount=Decimal(60),
+            list_price=Decimal(80),
+            inventory_item_id=item.id,
         )
         offer_id = offer.id
         session.commit()
@@ -344,8 +414,11 @@ async def test_offer_low_is_countered(env) -> None:
     account = _account(env, "ebay", "ebay-main")
     with env["factory"]() as session:
         offer = MarketplaceOfferRepository(session).upsert(
-            account_id=account.id, remote_offer_id="OF-2",
-            offer_amount=Decimal(15), list_price=Decimal(80), inventory_item_id=item.id,
+            account_id=account.id,
+            remote_offer_id="OF-2",
+            offer_amount=Decimal(15),
+            list_price=Decimal(80),
+            inventory_item_id=item.id,
         )
         offer_id = offer.id
         session.commit()
@@ -413,10 +486,14 @@ def test_offer_policy_minimum_proceeds_is_authoritative() -> None:
 async def test_routine_message_answered(env) -> None:
     account = _account(env, "ebay", "ebay-main")
     with env["factory"]() as session:
-        thread = MessageRepository(session).upsert_thread(account_id=account.id, remote_thread_id="T-1")
+        thread = MessageRepository(session).upsert_thread(
+            account_id=account.id, remote_thread_id="T-1"
+        )
         thread_id = thread.id
         session.commit()
-    result = await env["service"].respond_message(thread_id, "Is this still available?", principal_scopes={"admin"})
+    result = await env["service"].respond_message(
+        thread_id, "Is this still available?", principal_scopes={"admin"}
+    )
     assert result["decision"] == "respond"
     assert result["category"] == "availability"
 
@@ -424,13 +501,44 @@ async def test_routine_message_answered(env) -> None:
 async def test_sensitive_message_escalates(env) -> None:
     account = _account(env, "ebay", "ebay-main")
     with env["factory"]() as session:
-        thread = MessageRepository(session).upsert_thread(account_id=account.id, remote_thread_id="T-2")
+        thread = MessageRepository(session).upsert_thread(
+            account_id=account.id, remote_thread_id="T-2"
+        )
         thread_id = thread.id
         session.commit()
     result = await env["service"].respond_message(
         thread_id, "This is a counterfeit, I'm calling my lawyer", principal_scopes={"admin"}
     )
     assert result["decision"] == "escalate"
+
+
+async def test_scheduled_message_sync_responds_once_without_storing_plaintext(env) -> None:
+    account = _account(env, "ebay", "message-scheduled")
+    adapter = env["broker"].acquire_adapter(account.id)
+    secret_body = "Is this still available? private-value-123"
+    adapter.seed_message("TH-SCHEDULED", secret_body, buyer="buyer@example.test")
+    first = await env["service"].process_routine_messages(account.id, principal_scopes={"admin"})
+    second = await env["service"].process_routine_messages(account.id, principal_scopes={"admin"})
+    assert first["processed"] == 1
+    assert second["processed"] == 0
+    assert adapter._sent_messages["TH-SCHEDULED"] == "Yes, this item is still available."
+    from goliath.db.models import MessageRecord
+
+    with env["factory"]() as session:
+        records = list(session.query(MessageRecord).all())
+    assert records
+    assert all(secret_body not in record.body_checksum for record in records)
+
+
+async def test_scheduled_offer_sync_is_idempotent(env) -> None:
+    account = _account(env, "ebay", "offer-scheduled")
+    env["broker"].acquire_adapter(account.id).seed_offer(
+        "OF-SCHEDULED", offer_amount="45", list_price="60"
+    )
+    first = await env["service"].sync_offers(account.id, principal_scopes={"admin"})
+    second = await env["service"].sync_offers(account.id, principal_scopes={"admin"})
+    assert first["synced"] == second["synced"] == 1
+    assert len(env["service"].list_offers()) == 1
 
 
 # ------------------------------------------------------------ price automation
@@ -466,8 +574,12 @@ async def test_label_purchase_and_ceiling(env) -> None:
     await env["service"].publish_item(item.id, principal_scopes={"admin"})
     active = [x for x in env["service"].list_listings() if x.status is RemoteListingStatus.ACTIVE]
     env["adapters"]["ebay"].seed_order(
-        "O-3", sale_price="40", status="paid", inventory_item_id=str(item.id),
-        remote_listing_id=active[0].remote_listing_id, buyer="b3",
+        "O-3",
+        sale_price="40",
+        status="paid",
+        inventory_item_id=str(item.id),
+        remote_listing_id=active[0].remote_listing_id,
+        buyer="b3",
     )
     await env["service"].sync_orders(a1.id, principal_scopes={"admin"})
     from goliath.db.marketplace_repositories import ShippingTaskRepository
@@ -510,8 +622,12 @@ def test_reconciliation_arithmetic_and_discrepancy(env) -> None:
     account = _account(env, "ebay", "ebay-main")
     with env["factory"]() as session:
         order, _ = MarketplaceOrderRepository(session).upsert(
-            account_id=account.id, remote_order_id="R-1", sale_price=Decimal(40),
-            status=OrderStatus.PAID, payload_checksum="c1", marketplace_fees=Decimal(4),
+            account_id=account.id,
+            remote_order_id="R-1",
+            sale_price=Decimal(40),
+            status=OrderStatus.PAID,
+            payload_checksum="c1",
+            marketplace_fees=Decimal(4),
             shipping_charged=Decimal(5),
         )
         order_id = order.id
@@ -530,8 +646,12 @@ def test_reconciliation_detects_missing_fees(env) -> None:
     account = _account(env, "ebay", "ebay-main")
     with env["factory"]() as session:
         order, _ = MarketplaceOrderRepository(session).upsert(
-            account_id=account.id, remote_order_id="R-2", sale_price=Decimal(40),
-            status=OrderStatus.PAID, payload_checksum="c2", marketplace_fees=Decimal(0),
+            account_id=account.id,
+            remote_order_id="R-2",
+            sale_price=Decimal(40),
+            status=OrderStatus.PAID,
+            payload_checksum="c2",
+            marketplace_fees=Decimal(0),
         )
         order_id = order.id
         session.commit()
@@ -546,10 +666,14 @@ async def test_emergency_stop_blocks_writes(env) -> None:
     item = _ready_item(env)
     account = _account(env, "ebay", "ebay-main")
     env["service"].emergency_stop(reason="account challenge")
-    result = await env["service"].publish_item(item.id, account_ids=[account.id], principal_scopes={"admin"})
+    result = await env["service"].publish_item(
+        item.id, account_ids=[account.id], principal_scopes={"admin"}
+    )
     assert result["results"]["ebay-main"] == "blocked"
     env["service"].emergency_start(reason="resolved")
-    result2 = await env["service"].publish_item(item.id, account_ids=[account.id], principal_scopes={"admin"})
+    result2 = await env["service"].publish_item(
+        item.id, account_ids=[account.id], principal_scopes={"admin"}
+    )
     assert result2["results"]["ebay-main"] == "published"
 
 
@@ -560,7 +684,9 @@ async def test_circuit_breaker_opens_after_failures(env) -> None:
     env["adapters"]["ebay"]._fail_operations = {"create_listing"}
     env["config"].marketplace.circuit_breaker.failure_threshold = 2
     for _ in range(3):
-        await env["service"].publish_item(item.id, account_ids=[account.id], principal_scopes={"admin"})
+        await env["service"].publish_item(
+            item.id, account_ids=[account.id], principal_scopes={"admin"}
+        )
     breakers = env["service"].list_breakers()
     assert any(b.state.value == "open" for b in breakers)
 
@@ -586,6 +712,4 @@ def test_account_scoped_marketplace_authority(env) -> None:
         session_factory=env["factory"], config=env["config"], broker=env["broker"]
     )
     assert gateway._scope_ok("marketplace:read", {f"marketplace:read@{first.id}"}, first.id)
-    assert not gateway._scope_ok(
-        "marketplace:read", {f"marketplace:read@{first.id}"}, second.id
-    )
+    assert not gateway._scope_ok("marketplace:read", {f"marketplace:read@{first.id}"}, second.id)

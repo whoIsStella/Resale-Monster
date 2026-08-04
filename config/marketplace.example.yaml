@@ -19,11 +19,8 @@ marketplace:
       automation_mode: disabled  # change to autonomous_conservative after authentication
       currency: USD
       allowed_domains: [ebay.com]
-      capabilities: [read_account, read_listings, read_listing, read_orders, read_order,
-        read_offers, read_messages, read_notifications, create_listing, update_listing,
-        refresh_listing, promote_listing, end_listing, accept_offer, decline_offer,
-        counter_offer, send_offer, send_message, update_tracking, estimate_fees,
-        read_shipping_options, purchase_label, sync_account]
+      # Browser skeletons advertise only operations they actually implement.
+      capabilities: [authentication_status, read_account, sync_account]
       operation_modes:
         purchase_label: shadow
     poshmark-main:
@@ -32,9 +29,7 @@ marketplace:
       automation_mode: disabled  # change to autonomous_normal after shadow validation
       currency: USD
       allowed_domains: [poshmark.com]
-      capabilities: [read_account, read_listings, read_listing, read_orders, create_listing,
-        update_listing, refresh_listing, share_listing, end_listing, read_offers,
-        accept_offer, decline_offer, counter_offer, send_message, sync_account]
+      capabilities: [authentication_status, read_account, sync_account]
   publishing:
     minimum_expected_profit: 12.00
     require_images: true
@@ -89,6 +84,22 @@ marketplace:
     failure_threshold: 5
     cooldown_seconds: 300
     half_open_probe_after_seconds: 300
+  schedules:
+    account_sync: {enabled: true, interval_seconds: 300}
+    listing_sync: {enabled: true, interval_seconds: 600}
+    listing_reconciliation: {enabled: true, interval_seconds: 1800}
+    order_sync: {enabled: true, interval_seconds: 300}
+    offer_sync: {enabled: true, interval_seconds: 300}
+    message_sync: {enabled: true, interval_seconds: 300}
+    pricing: {enabled: true, interval_seconds: 21600}
+    refresh: {enabled: true, interval_seconds: 43200}
+    promotion_share: {enabled: true, interval_seconds: 10800}
+    stale_inventory: {enabled: true, interval_seconds: 86400}
+    shipping: {enabled: true, interval_seconds: 600}
+    tracking: {enabled: true, interval_seconds: 900}
+    financial_reconciliation: {enabled: true, interval_seconds: 3600}
+    reservation_cleanup: {enabled: true, interval_seconds: 3600}
+    circuit_breaker_probe: {enabled: true, interval_seconds: 300}
   operation_rate_limit_per_minute: 60
   max_publish_per_hour: 100
   max_delisting_latency_seconds: 900
