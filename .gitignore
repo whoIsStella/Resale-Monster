@@ -30,7 +30,6 @@ dist/
 .eggs/
 wheels/
 
-# Environment variables, credentials, and local configuration
 .env
 .env.*
 !.env.example
@@ -81,3 +80,6 @@ Thumbs.db
 
 # Project scripts are source files (override broad global ignore rules).
 !/scripts/*.sh
+
+# Local helper scripts
+scripts/
