@@ -37,11 +37,7 @@ wheels/
 *.key
 *.p12
 *.pfx
-/config/agents.yaml
-/config/marketplace.yaml
-/config/media.yaml
-/config/mcp-hermes.json
-/config/mcp-http.json
+
 
 # Local databases, logs, and runtime state
 *.db
@@ -56,9 +52,6 @@ wheels/
 /tmp/
 
 # Local agent/editor state
-/.agents/
-/.claude/
-/.codex/
 .idea/
 .vscode/
 *.swp
@@ -69,20 +62,7 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# Local prompts and review artifacts
-/fix-fastapi-dependencies.txt
-/inspect-api-auth.txt
-/milestone-five.txt
-/milestone-six.txt
-/milestone-six-fixes.txt
-/milestone-six-review.txt
-/milestone-three.txt
-/milestone-four.txt
-/milestone-six-scheduler-completion.txt
-/review/
-/AGENTS.md
 # Project scripts are source files (override broad global ignore rules).
+/scripts/*
 !/scripts/*.sh
 
-# Local helper scripts
-scripts/
