@@ -1,0 +1,22 @@
+{
+  "sku": "VJ-0001",
+  "title": "Vintage Levi's Denim Trucker Jacket",
+  "brand": "Levi's",
+  "model_name": "Type III Trucker",
+  "category": "clothing",
+  "subcategory": "jackets",
+  "department": "mens",
+  "size_label": "M",
+  "normalized_size": "M",
+  "colors": ["indigo"],
+  "materials": ["cotton"],
+  "pattern": "solid",
+  "condition": "good",
+  "condition_grade": "B",
+  "condition_notes": "Light wear at cuffs; no rips.",
+  "defects": ["fading at collar"],
+  "acquisition_cost": "18.00",
+  "acquisition_source": "estate sale",
+  "storage_location": "bin-A12",
+  "status": "research_needed"
+}

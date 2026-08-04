@@ -1,0 +1,50 @@
+default_timeout_seconds: 600
+maximum_timeout_seconds: 3600
+default_output_limit_chars: 100000
+maximum_output_limit_chars: 1000000
+cancellation_grace_seconds: 5
+
+# Replace this with explicit engineering-workspace roots on the deployment host.
+workspace_roots:
+  - /srv/resale-goliath/workspaces
+
+agents:
+  codex:
+    enabled: true
+    adapter: codex
+    command_template: ["codex", "exec", "{prompt}"]
+    capabilities: [coding, testing, review]
+    task_types: [code_change, test, review]
+    permissions: [read_files, write_files, run_commands]
+    priority: 10
+    environment_allowlist: [PATH, HOME, LANG, LC_ALL, TERM]
+
+  hermes:
+    enabled: false
+    adapter: hermes
+    command_template: ["/opt/hermes/bin/hermes", "--profile", "{profile}", "{prompt}"]
+    profile: local
+    capabilities: [research, operations, analysis, web_research, inventory_read, research_write,
+      pricing_calculation, listing_draft_generation, approval_request_creation]
+    task_types: [research, operations, analysis, product_identification, comparable_research,
+      listing_generation, pricing_analysis, inventory_quality_review, stale_inventory_review]
+    permissions: [read_files]
+    priority: 20
+    environment_allowlist: [PATH, HOME, LANG, LC_ALL, TERM]
+    # MCP scopes Hermes' service principal holds. Commerce-domain tasks are never
+    # routed to an agent that is missing a required scope.
+    mcp_scopes: [inventory:read, inventory:write_draft, research:read, research:write,
+      pricing:calculate, listing:read, listing:write_draft, approval:read, approval:request]
+    preferred_domain_task_types: [product_identification, comparable_research,
+      stale_inventory_review, inventory_quality_review]
+
+  # Generic agents use the same supervised, argument-sequence-only subprocess adapter.
+  local-reviewer:
+    enabled: false
+    adapter: subprocess
+    command_template: ["/opt/resale-agents/reviewer", "--prompt", "{prompt}"]
+    capabilities: [review]
+    task_types: [review]
+    permissions: [read_files]
+    priority: 30
+    environment_allowlist: [PATH, HOME, LANG, LC_ALL, TERM]

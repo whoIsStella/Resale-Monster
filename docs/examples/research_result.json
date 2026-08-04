@@ -1,0 +1,15 @@
+{
+  "research_id": "b2b4...",
+  "status": "completed",
+  "confidence": "0.88",
+  "sources": [
+    {"source_type": "brand_catalog", "reliability": "official", "content_hash": "sha256:...",
+     "url": "https://example.test/levis/type-iii"}
+  ],
+  "candidates": [
+    {"brand": "Levi's", "model_name": "Type III Trucker", "confidence": "0.88",
+     "evidence_source_ids": ["src-1"]}
+  ],
+  "selected_identification": {"brand": "Levi's", "model_name": "Type III Trucker", "confidence": "0.88"},
+  "unresolved_questions": ["exact production year"]
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=Resale Goliath orchestration API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/resale-goliath
+EnvironmentFile=/etc/resale-goliath/environment
+ExecStart=/srv/resale-goliath/.venv/bin/python -m goliath.api_runner
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

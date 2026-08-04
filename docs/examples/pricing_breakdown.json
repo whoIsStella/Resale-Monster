@@ -1,0 +1,16 @@
+{
+  "recommended_price": "68.80",
+  "fast_sale_price": "58.48",
+  "minimum_price": "29.08",
+  "expected_net_proceeds": "59.56",
+  "expected_profit": "39.56",
+  "expected_margin": "0.5749",
+  "confidence": "0.610",
+  "fee_version": "generic-v1",
+  "breakdown": {
+    "market_reference": "86", "sold_mean": "80", "active_mean": "100",
+    "condition_adjustment": "0.8", "fee_percent": "0.10", "payment_percent": "0.03",
+    "fixed_fee": "0.30", "cost_basis": "20", "minimum_acceptable_profit": "5"
+  },
+  "warnings": []
+}

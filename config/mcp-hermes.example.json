@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "goliath": {
+      "command": "python",
+      "args": ["-m", "goliath.mcp", "--transport", "stdio"],
+      "env": {
+        "GOLIATH_CONFIG": "/srv/resale-goliath/config/agents.yaml",
+        "GOLIATH_DATABASE_URL": "postgresql+psycopg://goliath_app@localhost/resale_goliath",
+        "GOLIATH_MCP_CREDENTIAL": "mcp_REPLACE_WITH_ISSUED_SERVICE_PRINCIPAL_CREDENTIAL"
+      }
+    }
+  },
+  "_notes": "The credential is an MCP service-principal secret shown once at creation. Never commit a real value. Goliath stores only its SHA-256 hash and enforces scopes, expiration, and revocation. The database URL belongs in the application environment only."
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=Resale Goliath durable worker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/resale-goliath
+EnvironmentFile=/etc/resale-goliath/environment
+ExecStart=/srv/resale-goliath/.venv/bin/goliath worker start
+Restart=on-failure
+KillSignal=SIGTERM
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

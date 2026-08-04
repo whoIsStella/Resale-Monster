@@ -1,0 +1,12 @@
+{
+  "id": "d1e2...",
+  "status": "draft",
+  "title": "Levi's Type III Trucker Vintage Denim Jacket",
+  "condition": "good",
+  "size": "M",
+  "colors": ["indigo"],
+  "materials": ["cotton"],
+  "measurements": [{"type": "chest_flat", "value_cm": "56.000"}],
+  "validation_warnings": ["description is empty"],
+  "missing_fields": []
+}

@@ -1,0 +1,12 @@
+{
+  "id": "p9a8...",
+  "type": "identification_selection",
+  "resource_type": "inventory_item",
+  "resource_id": "a1b2...",
+  "current_version": 3,
+  "proposed_payload": {"brand": "Levi's", "model_name": "Type III Trucker", "identification_confidence": "0.88"},
+  "justification": "Research b2b4 identification (confidence=0.88, threshold=0.85)",
+  "risk_tier": "low",
+  "status": "pending",
+  "requested_by": "service_principal:hermes"
+}

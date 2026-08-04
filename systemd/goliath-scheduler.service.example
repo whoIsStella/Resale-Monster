@@ -1,0 +1,13 @@
+[Unit]
+Description=Resale Goliath scheduler tick
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/resale-goliath
+EnvironmentFile=/etc/resale-goliath/environment
+ExecStart=/srv/resale-goliath/.venv/bin/goliath schedule tick
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
