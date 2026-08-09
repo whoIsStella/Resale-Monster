@@ -7,6 +7,7 @@ dependencies = [
   "alembic>=1.13,<2",
   "cryptography>=42,<46",
   "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
   "Pillow>=10,<12",
   "python-multipart>=0.0.9,<1",
   "pydantic>=2.7,<3",
@@ -18,7 +19,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["anyio>=4.4,<5",
-  "httpx2>=2,<3",
   "pytest>=8,<9",
   "pytest-asyncio>=0.23,<1",
   "ruff>=0.5,<1",]
@@ -34,6 +34,14 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+addopts = "-m 'not integration_sandbox and not integration_live_read and not integration_live_write'"
+markers = [
+  "unit: safe isolated unit tests",
+  "integration_fake: safe offline integration tests",
+  "integration_sandbox: opt-in eBay Sandbox tests",
+  "integration_live_read: opt-in production read tests with a dedicated account",
+  "integration_live_write: opt-in canary-limited production write tests",
+]
 
 [tool.ruff]
 line-length = 100

@@ -54,6 +54,8 @@ class AdapterProvisioning:
         storage_dir: Path,
         session_state: bytes,
         browser_executable: str | None,
+        automation_mode: str = "disabled",
+        account_label: str = "",
     ) -> None:
         self.marketplace = marketplace
         self.account_id = account_id
@@ -61,6 +63,8 @@ class AdapterProvisioning:
         self.storage_dir = storage_dir
         self.session_state = session_state  # decrypted; adapter-private
         self.browser_executable = browser_executable
+        self.automation_mode = automation_mode
+        self.account_label = account_label
 
 
 class SessionBroker:
@@ -79,13 +83,56 @@ class SessionBroker:
         self._custom_adapter_factory = adapter_factory is not None
         self._adapter_factory = adapter_factory or self._production_adapter
 
-    @staticmethod
-    def _production_adapter(provisioning: AdapterProvisioning) -> MarketplaceAdapter:
+    def _production_adapter(self, provisioning: AdapterProvisioning) -> MarketplaceAdapter:
         """Select an explicit adapter; never silently simulate a production write."""
+        if provisioning.automation_mode in {"fake", "simulation"}:
+            return FakeMarketplaceAdapter(marketplace=provisioning.marketplace)
         if provisioning.marketplace == "fake":
             return FakeMarketplaceAdapter(marketplace="fake")
         if provisioning.marketplace == "generic":
             return ManualMarketplaceAdapter()
+        if provisioning.marketplace == "ebay":
+            from goliath.marketplace.ebay import (
+                EBAY_PRODUCTION_API,
+                EBAY_SANDBOX_API,
+                EbayAdapterSettings,
+                EbayMarketplaceAdapter,
+                EbayTransport,
+            )
+            from goliath.marketplace.ebay_auth import EbayOAuthCredential
+
+            credential = EbayOAuthCredential.from_bytes(provisioning.session_state)
+            account_config = self._config.marketplace.accounts.get(provisioning.account_label)
+            settings = EbayAdapterSettings(
+                marketplace_id=account_config.ebay_marketplace_id if account_config else "EBAY_US",
+                merchant_location_key=account_config.merchant_location_key
+                if account_config
+                else None,
+                payment_policy_id=account_config.payment_policy_id if account_config else None,
+                fulfillment_policy_id=(
+                    account_config.fulfillment_policy_id if account_config else None
+                ),
+                return_policy_id=account_config.return_policy_id if account_config else None,
+            )
+            transport_config = self._config.marketplace.transport
+            base_url = (
+                EBAY_SANDBOX_API
+                if provisioning.automation_mode == "sandbox"
+                else EBAY_PRODUCTION_API
+            )
+            return EbayMarketplaceAdapter(
+                transport=EbayTransport(
+                    access_token=credential.access_token,
+                    base_url=base_url,
+                    marketplace_id=settings.marketplace_id,
+                    connect_timeout=transport_config.connect_timeout_seconds,
+                    read_timeout=transport_config.read_timeout_seconds,
+                    total_timeout=transport_config.total_timeout_seconds,
+                    max_response_bytes=transport_config.max_response_bytes,
+                    max_retries=transport_config.max_retries,
+                ),
+                settings=settings,
+            )
         from goliath.marketplace.browser_adapter import BROWSER_ADAPTERS
 
         adapter_type = BROWSER_ADAPTERS.get(provisioning.marketplace)
@@ -104,6 +151,8 @@ class SessionBroker:
     def _build_cipher(self) -> SessionCipher:
         key = self._session_config.encryption_key or os.environ.get("GOLIATH_SESSION_KEY")
         if not key:
+            if self._config.marketplace.ebay_oauth.enabled:
+                raise SessionBrokerError("persistent encryption key required for eBay OAuth")
             # Ephemeral key: encryption still applies at rest for this process.
             key = SessionCipher.generate_key()
         return SessionCipher(key)
@@ -190,6 +239,8 @@ class SessionBroker:
                 raise SessionBrokerError("account requires reauthentication; writes are paused")
             reference = SessionReferenceRepository(session).get_active(account_id)
             marketplace = account.marketplace.value
+            automation_mode = account.automation_mode.value
+            account_label = account.account_label
             session.expunge(account)
 
         if reference is None:
@@ -201,6 +252,8 @@ class SessionBroker:
                 storage_dir=self._session_root() / "unbound",
                 session_state=b"",
                 browser_executable=self._session_config.browser_executable,
+                automation_mode=automation_mode,
+                account_label=account_label,
             )
             return self._adapter_factory(provisioning)
 
@@ -220,8 +273,26 @@ class SessionBroker:
             storage_dir=Path(reference.storage_dir),
             session_state=session_state,
             browser_executable=self._session_config.browser_executable,
+            automation_mode=automation_mode,
+            account_label=account_label,
         )
         return self._adapter_factory(provisioning)
+
+    def read_ebay_credential(self, account_id: UUID):
+        """Return a credential only to the OAuth lifecycle service inside this package."""
+        from goliath.marketplace.ebay_auth import EbayOAuthCredential
+
+        with self._session_factory() as session:
+            account = MarketplaceAccountRepository(session).require(account_id)
+            if account.marketplace.value != "ebay":
+                raise SessionBrokerError("credential marketplace mismatch")
+            reference = SessionReferenceRepository(session).get_active(account_id)
+        if reference is None:
+            raise SessionBrokerError("eBay credential is unavailable or expired")
+        try:
+            return EbayOAuthCredential.from_bytes(self._cipher.decrypt(reference.ciphertext))
+        except Exception as error:
+            raise SessionBrokerError("failed to decrypt eBay credential") from error
 
     def revoke_session(self, account_id: UUID, *, actor: str = "human:operator") -> None:
         storage_dir: Path | None = None
@@ -233,9 +304,7 @@ class SessionBroker:
                 storage_dir = Path(reference.storage_dir).resolve()
             accounts = MarketplaceAccountRepository(session)
             accounts.set_session(account_id, reference=None, expires_at=None)
-            accounts.set_status(
-                account_id, status=MarketplaceAccountStatus.AUTHENTICATION_REQUIRED
-            )
+            accounts.set_status(account_id, status=MarketplaceAccountStatus.AUTHENTICATION_REQUIRED)
             AuditEventRepository(session).append(
                 event_type="session.revoked",
                 actor_type="human",

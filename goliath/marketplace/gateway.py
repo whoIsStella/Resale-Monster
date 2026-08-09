@@ -10,6 +10,8 @@ classifies errors; and returns a typed receipt.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
 from collections import Counter
 from collections.abc import Awaitable, Callable
@@ -93,6 +95,7 @@ class OperationReceipt:
     mode: str | None = None
     reasons: list[str] = field(default_factory=list)
     data: dict[str, Any] = field(default_factory=dict)
+    retry_after_seconds: int | None = None
 
 
 class MarketplaceGateway:
@@ -138,7 +141,10 @@ class MarketplaceGateway:
         if not self._scope_ok(scope, principal_scopes, account_id):
             self.metrics.by_operation[operation] += 1
             return OperationReceipt(
-                ok=False, operation=operation, executed=False, error_category="unauthorized",
+                ok=False,
+                operation=operation,
+                executed=False,
+                error_category="unauthorized",
                 reasons=[f"scope required: {scope}"],
             )
 
@@ -146,7 +152,7 @@ class MarketplaceGateway:
         mode = self._effective_mode(account, operation, mode)
         self.metrics.by_operation[operation] += 1
 
-        block = self._precheck(account, mode, operation, is_write=is_write)
+        block = self._precheck(account, mode, operation, is_write=is_write, resource_id=resource_id)
         if block is not None:
             return block
 
@@ -157,7 +163,7 @@ class MarketplaceGateway:
                 return replay
 
         # Shadow mode: compute the intent, record it, but do not execute the write.
-        if is_write and mode is AutomationMode.SHADOW:
+        if is_write and mode in {AutomationMode.SHADOW, AutomationMode.SIMULATION}:
             self.metrics.shadow_writes += 1
             attempt_id = self._record_attempt(
                 account_id,
@@ -188,7 +194,11 @@ class MarketplaceGateway:
             "authentication_status",
         }:
             return self._fail(
-                account_id, operation, mode, "not_supported", is_write,
+                account_id,
+                operation,
+                mode,
+                "not_supported",
+                is_write,
                 reasons=[f"adapter does not support {operation}"],
             )
 
@@ -200,8 +210,16 @@ class MarketplaceGateway:
 
         if not result.ok:
             return self._handle_failure(
-                account, operation, mode, result, is_write, agent_identity,
-                idempotency_key, resource_type, resource_id, request_summary,
+                account,
+                operation,
+                mode,
+                result,
+                is_write,
+                agent_identity,
+                idempotency_key,
+                resource_type,
+                resource_id,
+                request_summary,
             )
 
         verified = False
@@ -213,7 +231,9 @@ class MarketplaceGateway:
             if not verified:
                 self.metrics.verification_failures += 1
                 self._open_exception(
-                    account_id, "verification_failed", operation,
+                    account_id,
+                    "verification_failed",
+                    operation,
                     "post-write verification was inconclusive",
                     resource_id=resource_id,
                 )
@@ -251,6 +271,7 @@ class MarketplaceGateway:
             status=OperationStatus.VERIFIED if verified else OperationStatus.SUCCEEDED,
             result=result.data,
             remote_identifier=result.remote_id,
+            remote_request_id=result.remote_request_id,
             verified=verified,
         )
         if is_write:
@@ -278,16 +299,12 @@ class MarketplaceGateway:
             data=result.data,
             error_category="verification_failed" if is_write and not verified else None,
             reasons=(
-                ["post-write verification was inconclusive"]
-                if is_write and not verified
-                else []
+                ["post-write verification was inconclusive"] if is_write and not verified else []
             ),
         )
 
     # ---------------------------------------------------------------- internals
-    def _scope_ok(
-        self, scope: str, principal_scopes: set[str] | None, account_id: UUID
-    ) -> bool:
+    def _scope_ok(self, scope: str, principal_scopes: set[str] | None, account_id: UUID) -> bool:
         if principal_scopes is None:
             return True  # trusted internal caller (scheduler/service)
         return (
@@ -311,9 +328,7 @@ class MarketplaceGateway:
             "send_offer": data.get("sent") is True,
             "send_message": data.get("delivered") is True,
             "update_tracking": bool(data.get("tracking_number")),
-            "purchase_label": bool(
-                data.get("label_reference") and data.get("tracking_number")
-            ),
+            "purchase_label": bool(data.get("label_reference") and data.get("tracking_number")),
         }
         return bool(checks.get(operation, False))
 
@@ -346,14 +361,28 @@ class MarketplaceGateway:
         return mode
 
     def _precheck(
-        self, account: MarketplaceAccount, mode: AutomationMode, operation: str, *, is_write: bool
+        self,
+        account: MarketplaceAccount,
+        mode: AutomationMode,
+        operation: str,
+        *,
+        is_write: bool,
+        resource_id: UUID | None = None,
     ) -> OperationReceipt | None:
         if mode is AutomationMode.DISABLED:
             return self._blocked(operation, mode, ["automation disabled for account"])
         if not is_write:
             return None  # reads are permitted in every non-disabled mode
         with self._session_factory() as session:
-            if EmergencyStopRepository(session).is_active(str(account.id)):
+            stops = EmergencyStopRepository(session)
+            stop_keys = {
+                str(account.id),
+                f"marketplace:{account.marketplace.value}",
+                f"operation:{account.id}:{operation}",
+            }
+            if resource_id is not None:
+                stop_keys.add(f"resource:{resource_id}")
+            if any(stops.is_active(key) for key in stop_keys):
                 return self._blocked(operation, mode, ["emergency stop active"])
             breaker = CircuitBreakerRepository(session)
             if breaker.is_open(scope="global", scope_key="*"):
@@ -369,22 +398,51 @@ class MarketplaceGateway:
                 session.commit()
                 return self._blocked(operation, mode, ["operation circuit breaker open"])
             attempts = OperationAttemptRepository(session)
-            if attempts.count_since(
-                since=utc_now() - timedelta(minutes=1), account_id=account.id
-            ) >= self._marketplace.operation_rate_limit_per_minute:
+            if (
+                attempts.count_since(since=utc_now() - timedelta(minutes=1), account_id=account.id)
+                >= self._marketplace.operation_rate_limit_per_minute
+            ):
                 return self._blocked(operation, mode, ["configured operation rate limit reached"])
-            if operation == "create_listing" and attempts.count_since(
-                since=utc_now() - timedelta(hours=1), operation="create_listing"
-            ) >= self._marketplace.max_publish_per_hour:
+            if (
+                operation == "create_listing"
+                and attempts.count_since(
+                    since=utc_now() - timedelta(hours=1), operation="create_listing"
+                )
+                >= self._marketplace.max_publish_per_hour
+            ):
                 return self._blocked(operation, mode, ["configured publish volume reached"])
+            if mode is AutomationMode.CANARY:
+                canary = self._marketplace.canary
+                if canary.allowed_account_ids and str(account.id) not in canary.allowed_account_ids:
+                    return self._blocked(operation, mode, ["account is outside canary allowlist"])
+                if canary.allowed_operations and operation not in canary.allowed_operations:
+                    return self._blocked(operation, mode, ["operation is outside canary allowlist"])
+                if (
+                    resource_id is not None
+                    and canary.allowed_inventory_ids
+                    and str(resource_id) not in canary.allowed_inventory_ids
+                ):
+                    return self._blocked(operation, mode, ["resource is outside canary allowlist"])
+                if (
+                    attempts.count_since(
+                        since=utc_now() - timedelta(hours=1), account_id=account.id
+                    )
+                    >= canary.maximum_writes_per_hour
+                ):
+                    return self._blocked(operation, mode, ["canary hourly write limit reached"])
             session.commit()
         if account.status in WRITE_FORBIDDEN_ACCOUNT_STATUSES:
-            return self._blocked(operation, mode, [f"account status forbids writes: {account.status.value}"])
+            return self._blocked(
+                operation, mode, [f"account status forbids writes: {account.status.value}"]
+            )
         if mode is AutomationMode.PAUSED:
             return self._blocked(operation, mode, ["account is paused"])
         if mode is AutomationMode.OBSERVE:
             return self._blocked(operation, mode, ["observe mode: reads only"])
-        if mode not in AUTONOMOUS_WRITE_MODES and mode is not AutomationMode.SHADOW:
+        if mode not in AUTONOMOUS_WRITE_MODES and mode not in {
+            AutomationMode.SHADOW,
+            AutomationMode.SIMULATION,
+        }:
             return self._blocked(operation, mode, [f"writes not permitted in mode {mode.value}"])
         return None
 
@@ -412,16 +470,33 @@ class MarketplaceGateway:
         return None
 
     def _handle_failure(
-        self, account, operation, mode, result, is_write, agent_identity,
-        idempotency_key, resource_type, resource_id, request_summary,
+        self,
+        account,
+        operation,
+        mode,
+        result,
+        is_write,
+        agent_identity,
+        idempotency_key,
+        resource_type,
+        resource_id,
+        request_summary,
     ) -> OperationReceipt:
-        category = result.error_category or "transient"
+        category = result.error_category or "temporary_remote"
+        category = {
+            "auth_required": "authentication",
+            "rate_limited": "rate_limit",
+            "not_supported": "unsupported",
+            "verification_failed": "verification",
+            "transient": "temporary_remote",
+            "invalid": "validation",
+        }.get(category, category)
         if is_write:
             self.metrics.write_failures += 1
-        if category == "auth_required":
+        if category == "authentication":
             self.metrics.auth_failures += 1
             self._require_reauth(account.id)
-        if category == "rate_limited":
+        if category == "rate_limit":
             self.metrics.rate_limit_events += 1
         self._record_attempt(
             account.id,
@@ -435,8 +510,15 @@ class MarketplaceGateway:
             status=OperationStatus.FAILED,
             result=result.data,
             error_category=category,
+            remote_request_id=result.remote_request_id,
         )
-        if is_write:
+        if is_write and category not in {
+            "rate_limit",
+            "validation",
+            "unsupported",
+            "not_found",
+            "conflict",
+        }:
             self._record_breaker_failure(account.id, operation, category)
         self._audit(account.id, f"marketplace.{operation}.failed", {"category": category})
         return OperationReceipt(
@@ -446,12 +528,17 @@ class MarketplaceGateway:
             error_category=category,
             mode=mode.value,
             reasons=[result.data.get("detail", category)],
+            retry_after_seconds=result.retry_after_seconds,
         )
 
     def _blocked(self, operation, mode, reasons) -> OperationReceipt:
         return OperationReceipt(
-            ok=False, operation=operation, executed=False, error_category="blocked",
-            mode=mode.value, reasons=reasons,
+            ok=False,
+            operation=operation,
+            executed=False,
+            error_category="blocked",
+            mode=mode.value,
+            reasons=reasons,
         )
 
     def _fail(self, account_id, operation, mode, category, is_write, reasons) -> OperationReceipt:
@@ -459,14 +546,31 @@ class MarketplaceGateway:
             self.metrics.write_failures += 1
         self._audit(account_id, f"marketplace.{operation}.failed", {"category": category})
         return OperationReceipt(
-            ok=False, operation=operation, executed=False, error_category=category,
-            mode=mode.value, reasons=reasons,
+            ok=False,
+            operation=operation,
+            executed=False,
+            error_category=category,
+            mode=mode.value,
+            reasons=reasons,
         )
 
     def _record_attempt(
-        self, account_id, operation, idempotency_key, mode, agent_identity,
-        resource_type, resource_id, request_summary, *, status, result=None,
-        remote_identifier=None, verified=False, error_category=None,
+        self,
+        account_id,
+        operation,
+        idempotency_key,
+        mode,
+        agent_identity,
+        resource_type,
+        resource_id,
+        request_summary,
+        *,
+        status,
+        result=None,
+        remote_identifier=None,
+        remote_request_id=None,
+        verified=False,
+        error_category=None,
     ) -> str:
         # Successful attempts keep the real idempotency key so replays can find
         # them; non-success attempts get a unique key so retries never collide.
@@ -484,6 +588,14 @@ class MarketplaceGateway:
                 resource_type=resource_type,
                 resource_id=resource_id,
                 request_summary=request_summary or {},
+                requested_payload_hash=hashlib.sha256(
+                    json.dumps(
+                        request_summary or {},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ).encode()
+                ).hexdigest(),
             )
             repo.complete(
                 attempt.id,
@@ -492,6 +604,7 @@ class MarketplaceGateway:
                 remote_identifier=remote_identifier,
                 verified=verified,
                 error_category=error_category,
+                remote_request_id=remote_request_id,
             )
             session.commit()
             return str(attempt.id)
@@ -505,8 +618,10 @@ class MarketplaceGateway:
             )
             account_was_open = account_breaker.state.value == "open"
             account_after = repo.record_failure(
-                scope="account", scope_key=str(account_id),
-                threshold=rules.failure_threshold, cooldown_seconds=rules.cooldown_seconds,
+                scope="account",
+                scope_key=str(account_id),
+                threshold=rules.failure_threshold,
+                cooldown_seconds=rules.cooldown_seconds,
                 reason=f"{operation}:{category}",
             )
             operation_breaker = repo.get_or_create(
@@ -516,8 +631,10 @@ class MarketplaceGateway:
             )
             operation_was_open = operation_breaker.state.value == "open"
             operation_after = repo.record_failure(
-                scope="operation", scope_key=f"{account_id}:{operation}",
-                threshold=rules.failure_threshold, cooldown_seconds=rules.cooldown_seconds,
+                scope="operation",
+                scope_key=f"{account_id}:{operation}",
+                threshold=rules.failure_threshold,
+                cooldown_seconds=rules.cooldown_seconds,
                 reason=category,
             )
             opened = None
@@ -553,7 +670,9 @@ class MarketplaceGateway:
             )
             session.commit()
 
-    def _open_exception(self, account_id, exception_type, operation, reason, *, resource_id=None) -> None:
+    def _open_exception(
+        self, account_id, exception_type, operation, reason, *, resource_id=None
+    ) -> None:
         with self._session_factory() as session:
             ExceptionTaskRepository(session).create(
                 exception_type=exception_type,

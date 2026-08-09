@@ -6,6 +6,7 @@ contexts, arbitrary SQL, HTTP clients, credentials, or unrestricted filters.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -32,6 +33,7 @@ from goliath.db.models import (
     MarketplaceOrder,
     MessageRecord,
     MessageThread,
+    OAuthStateRecord,
     OfferDecision,
     OfferStatus,
     OperationStatus,
@@ -45,6 +47,7 @@ from goliath.db.models import (
     SessionReference,
     ShippingTask,
     SynchronizationConflict,
+    VerificationStatus,
     WebhookEvent,
     utc_now,
 )
@@ -228,6 +231,49 @@ class SessionReferenceRepository:
             self._session.flush()
 
 
+class OAuthStateRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def create(
+        self,
+        *,
+        account_id: UUID,
+        state: str,
+        redirect_uri: str,
+        requested_scopes: list[str],
+        expires_at: datetime,
+    ) -> OAuthStateRecord:
+        record = OAuthStateRecord(
+            account_id=account_id,
+            state_digest=hashlib.sha256(state.encode()).hexdigest(),
+            redirect_uri=redirect_uri,
+            requested_scopes=requested_scopes,
+            expires_at=expires_at,
+        )
+        self._session.add(record)
+        self._session.flush()
+        return record
+
+    def consume(
+        self, *, state: str, redirect_uri: str, now: datetime | None = None
+    ) -> OAuthStateRecord:
+        now = now or utc_now()
+        digest = hashlib.sha256(state.encode()).hexdigest()
+        record = self._session.scalar(
+            select(OAuthStateRecord).where(OAuthStateRecord.state_digest == digest)
+        )
+        if record is None or record.consumed_at is not None:
+            raise RecordNotFoundError("invalid or already-used OAuth state")
+        if _utc(record.expires_at) <= now:
+            raise InvalidStateTransitionError("OAuth state expired")
+        if record.redirect_uri != redirect_uri:
+            raise InvalidStateTransitionError("OAuth redirect URI mismatch")
+        record.consumed_at = now
+        self._session.flush()
+        return record
+
+
 class RemoteListingRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -260,6 +306,16 @@ class RemoteListingRepository:
     def get_by_idempotency(self, idempotency_key: str) -> RemoteListing | None:
         return self._session.scalar(
             select(RemoteListing).where(RemoteListing.idempotency_key == idempotency_key)
+        )
+
+    def get_by_remote_identity(
+        self, *, account_id: UUID, remote_listing_id: str
+    ) -> RemoteListing | None:
+        return self._session.scalar(
+            select(RemoteListing).where(
+                RemoteListing.account_id == account_id,
+                RemoteListing.remote_listing_id == remote_listing_id,
+            )
         )
 
     def find_active_on_account(
@@ -379,6 +435,9 @@ class OperationAttemptRepository:
             )
         )
 
+    def get(self, operation_id: UUID) -> MarketplaceOperationAttempt | None:
+        return self._session.get(MarketplaceOperationAttempt, operation_id)
+
     def count_since(
         self,
         *,
@@ -406,6 +465,8 @@ class OperationAttemptRepository:
         resource_type: str | None = None,
         resource_id: UUID | None = None,
         request_summary: dict[str, Any] | None = None,
+        job_id: UUID | None = None,
+        requested_payload_hash: str | None = None,
     ) -> MarketplaceOperationAttempt:
         attempt = MarketplaceOperationAttempt(
             account_id=account_id,
@@ -416,6 +477,8 @@ class OperationAttemptRepository:
             resource_type=resource_type,
             resource_id=resource_id,
             request_summary=request_summary or {},
+            job_id=job_id,
+            requested_payload_hash=requested_payload_hash,
             status=OperationStatus.RUNNING,
         )
         self._session.add(attempt)
@@ -431,6 +494,8 @@ class OperationAttemptRepository:
         remote_identifier: str | None = None,
         verified: bool = False,
         error_category: str | None = None,
+        remote_request_id: str | None = None,
+        verification_status: VerificationStatus | None = None,
     ) -> MarketplaceOperationAttempt:
         attempt = self._session.get(MarketplaceOperationAttempt, attempt_id)
         if attempt is None:
@@ -440,6 +505,10 @@ class OperationAttemptRepository:
         attempt.remote_identifier = remote_identifier
         attempt.verified = verified
         attempt.error_category = error_category
+        attempt.remote_request_id = remote_request_id
+        attempt.verification_status = verification_status or (
+            VerificationStatus.VERIFIED if verified else VerificationStatus.UNAVAILABLE
+        )
         attempt.completed_at = utc_now()
         self._session.flush()
         return attempt

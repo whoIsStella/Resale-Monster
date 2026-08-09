@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 # Every operation an adapter may declare and the gateway may invoke.
@@ -40,6 +41,15 @@ MARKETPLACE_OPERATIONS: tuple[str, ...] = (
     "read_shipping_options",
     "purchase_label",
     "sync_account",
+    "read_account_status",
+    "read_seller_limits",
+    "read_business_policies",
+    "read_ended_listings",
+    "update_price",
+    "update_quantity",
+    "reconcile_listing",
+    "read_fees",
+    "read_payouts",
 )
 
 # Error categories used for classification and circuit-breaker decisions.
@@ -54,8 +64,34 @@ ERROR_CATEGORIES = frozenset(
         "verification_failed",
         "invalid",
         "conflict",
+        "authentication",
+        "authorization",
+        "rate_limit",
+        "temporary_remote",
+        "permanent_remote",
+        "validation",
+        "unsupported",
+        "verification",
+        "transport",
+        "marketplace_suspension",
     }
 )
+
+
+class CapabilityStatus(StrEnum):
+    SUPPORTED = "supported"
+    UNSUPPORTED = "unsupported"
+    READ_ONLY = "read_only"
+    REQUIRES_MANUAL_STEP = "requires_manual_step"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class Capability:
+    operation: str
+    group: str
+    status: CapabilityStatus
+    detail: str | None = None
 
 
 @dataclass(slots=True)
@@ -68,6 +104,8 @@ class OperationResult:
     error_category: str | None = None
     rate_limit_remaining: int | None = None
     idempotent_replay: bool = False
+    remote_request_id: str | None = None
+    retry_after_seconds: int | None = None
 
     @classmethod
     def failure(cls, operation: str, category: str, detail: str = "") -> OperationResult:
@@ -118,6 +156,8 @@ class MarketplaceAdapter(Protocol):
     marketplace: str
 
     def capabilities(self) -> set[str]: ...
+
+    def capability_report(self) -> tuple[Capability, ...]: ...
 
     async def health_check(self) -> OperationResult: ...
 
@@ -173,6 +213,24 @@ class MarketplaceAdapter(Protocol):
 
     async def sync_account(self) -> OperationResult: ...
 
+    async def read_account_status(self) -> OperationResult: ...
+
+    async def read_seller_limits(self) -> OperationResult: ...
+
+    async def read_business_policies(self) -> OperationResult: ...
+
+    async def read_ended_listings(self) -> OperationResult: ...
+
+    async def update_price(self, remote_listing_id: str, price: Decimal) -> OperationResult: ...
+
+    async def update_quantity(self, remote_listing_id: str, quantity: int) -> OperationResult: ...
+
+    async def reconcile_listing(self, remote_listing_id: str) -> OperationResult: ...
+
+    async def read_fees(self, remote_order_id: str) -> OperationResult: ...
+
+    async def read_payouts(self) -> OperationResult: ...
+
 
 class BaseMarketplaceAdapter:
     """Default adapter: declares no write capability and fails unsupported operations safely."""
@@ -181,6 +239,21 @@ class BaseMarketplaceAdapter:
 
     def capabilities(self) -> set[str]:
         return set()
+
+    def capability_report(self) -> tuple[Capability, ...]:
+        supported = self.capabilities()
+        return tuple(
+            Capability(
+                operation=operation,
+                group=_capability_group(operation),
+                status=(
+                    CapabilityStatus.SUPPORTED
+                    if operation in supported
+                    else CapabilityStatus.UNSUPPORTED
+                ),
+            )
+            for operation in MARKETPLACE_OPERATIONS
+        )
 
     def _unsupported(self, operation: str) -> OperationResult:
         return OperationResult.failure(operation, "not_supported", f"{operation} not supported")
@@ -266,3 +339,54 @@ class BaseMarketplaceAdapter:
 
     async def sync_account(self) -> OperationResult:
         return self._unsupported("sync_account")
+
+    async def read_account_status(self) -> OperationResult:
+        return self._unsupported("read_account_status")
+
+    async def read_seller_limits(self) -> OperationResult:
+        return self._unsupported("read_seller_limits")
+
+    async def read_business_policies(self) -> OperationResult:
+        return self._unsupported("read_business_policies")
+
+    async def read_ended_listings(self) -> OperationResult:
+        return self._unsupported("read_ended_listings")
+
+    async def update_price(self, remote_listing_id: str, price: Decimal) -> OperationResult:
+        return self._unsupported("update_price")
+
+    async def update_quantity(self, remote_listing_id: str, quantity: int) -> OperationResult:
+        return self._unsupported("update_quantity")
+
+    async def reconcile_listing(self, remote_listing_id: str) -> OperationResult:
+        return self._unsupported("reconcile_listing")
+
+    async def read_fees(self, remote_order_id: str) -> OperationResult:
+        return self._unsupported("read_fees")
+
+    async def read_payouts(self) -> OperationResult:
+        return self._unsupported("read_payouts")
+
+
+def _capability_group(operation: str) -> str:
+    if "account" in operation or operation in {"health_check", "authentication_status"}:
+        return "account"
+    if "listing" in operation or operation in {
+        "update_price",
+        "update_quantity",
+        "refresh_listing",
+        "promote_listing",
+        "share_listing",
+    }:
+        return "listings"
+    if "order" in operation or operation in {"update_tracking"}:
+        return "orders"
+    if "offer" in operation:
+        return "offers"
+    if "message" in operation or "notification" in operation:
+        return "messages"
+    if "shipping" in operation or "label" in operation:
+        return "shipping"
+    if "fee" in operation or "payout" in operation:
+        return "financial"
+    return "account"

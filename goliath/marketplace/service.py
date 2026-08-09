@@ -204,6 +204,99 @@ class MarketplaceService:
             account_id, session_state, allowed_domains=allowed, actor=actor
         )
 
+    def connect_account(self, account_id: UUID, *, sandbox: bool = True):
+        from goliath.marketplace.ebay_auth import EbayOAuthService
+
+        oauth = EbayOAuthService(
+            session_factory=self._session_factory, config=self._config, broker=self._broker
+        )
+        return oauth.initiate(account_id, sandbox=sandbox)
+
+    async def complete_account_connection(self, *, code: str, state: str, sandbox: bool = True):
+        from goliath.marketplace.ebay_auth import EbayOAuthService
+
+        oauth = EbayOAuthService(
+            session_factory=self._session_factory, config=self._config, broker=self._broker
+        )
+        return await oauth.callback(code=code, state=state, sandbox=sandbox)
+
+    async def reauthenticate_account(self, account_id: UUID, *, sandbox: bool = True):
+        from goliath.marketplace.broker import SessionBrokerError
+        from goliath.marketplace.ebay_auth import EbayOAuthError, EbayOAuthService
+
+        oauth = EbayOAuthService(
+            session_factory=self._session_factory, config=self._config, broker=self._broker
+        )
+        try:
+            return await oauth.refresh(account_id, sandbox=sandbox)
+        except (EbayOAuthError, SessionBrokerError):
+            return oauth.initiate(account_id, sandbox=sandbox)
+
+    async def disconnect_account(self, account_id: UUID):
+        from goliath.marketplace.ebay_auth import EbayOAuthService
+
+        oauth = EbayOAuthService(
+            session_factory=self._session_factory, config=self._config, broker=self._broker
+        )
+        await oauth.revoke(account_id)
+        return {"account_id": str(account_id), "state": "revoked"}
+
+    async def validate_account(self, account_id: UUID, *, principal_scopes=None):
+        receipt = await self._gateway.execute(
+            account_id=account_id,
+            operation="authentication_status",
+            scope="marketplace:read",
+            principal_scopes=principal_scopes,
+            adapter_call=lambda adapter: adapter.authentication_status(),
+        )
+        with self._session_factory() as session:
+            account = MarketplaceAccountRepository(session).require(account_id)
+            if receipt.ok and receipt.data.get("authenticated"):
+                account.status = MarketplaceAccountStatus.ACTIVE
+                account.last_authentication_check_at = utc_now()
+                account.degradation_reason = None
+            else:
+                account.status = MarketplaceAccountStatus.AUTHENTICATION_REQUIRED
+                account.last_failed_authentication_check_at = utc_now()
+                account.degradation_reason = receipt.error_category or "authentication failed"
+            account.version += 1
+            session.commit()
+        return receipt
+
+    def account_connection(self, account_id: UUID) -> dict[str, Any]:
+        account = self.get_account(account_id)
+        return {
+            "id": str(account.id),
+            "marketplace": account.marketplace.value,
+            "remote_account_identifier": account.remote_account_identifier,
+            "seller_name": account.display_seller_name,
+            "granted_scopes": list(account.granted_scopes),
+            "credential_version": account.credential_version,
+            "authentication_expires_at": account.authentication_expires_at,
+            "last_successful_authentication_check": account.last_authentication_check_at,
+            "last_failed_authentication_check": account.last_failed_authentication_check_at,
+            "last_synchronization": account.last_sync_at,
+            "connection_state": account.status.value,
+            "degradation_reason": account.degradation_reason,
+            "disabled_reason": account.disabled_reason,
+            "mode": account.automation_mode.value,
+            "version": account.version,
+            "created_at": account.created_at,
+            "updated_at": account.updated_at,
+        }
+
+    def capabilities(self, account_id: UUID) -> list[dict[str, str | None]]:
+        adapter = self._broker.acquire_adapter(account_id)
+        return [
+            {
+                "operation": capability.operation,
+                "group": capability.group,
+                "status": capability.status.value,
+                "detail": capability.detail,
+            }
+            for capability in adapter.capability_report()
+        ]
+
     def _find_config_account(self, account):
         for cfg in self._marketplace.accounts.values():
             if cfg.marketplace == account.marketplace.value and cfg.label == account.account_label:
@@ -428,10 +521,29 @@ class MarketplaceService:
         )
         from goliath.db.models import DraftStatus
 
-        approved_draft = any(
-            d.inventory_item_id == item.id and d.status is DraftStatus.APPROVED
+        approved_drafts = [
+            d
             for d in ListingDraftRepository(session).list(limit=200)
-        )
+            if d.inventory_item_id == item.id and d.status is DraftStatus.APPROVED
+        ]
+        approved_draft = bool(approved_drafts)
+        variants_approved = approved_draft
+        if account.marketplace.value == "ebay" and account.automation_mode in {
+            AutomationMode.SANDBOX,
+            AutomationMode.CANARY,
+            AutomationMode.PRODUCTION,
+        }:
+            from goliath.db.domain_repositories import MarketplaceVariantRepository
+
+            variants_approved = bool(
+                approved_drafts
+                and any(
+                    variant.marketplace.value == "ebay" and variant.status is DraftStatus.APPROVED
+                    for variant in MarketplaceVariantRepository(session).list_for_draft(
+                        approved_drafts[-1].id
+                    )
+                )
+            )
         recs = PricingRecommendationRepository(session).list_for_item(item.id)
         expected_profit = recs[-1].expected_profit if recs else Decimal(0)
         image_count = len(list(InventoryMediaRepository(session).list_for_item(item.id)))
@@ -453,10 +565,14 @@ class MarketplaceService:
             P.PublishingInputs(
                 item_status=item.status.value,
                 draft_approved=approved_draft,
-                variants_approved=approved_draft,
+                variants_approved=variants_approved,
                 image_count=image_count,
                 pricing_current=bool(recs),
-                account_healthy=account.status is MarketplaceAccountStatus.HEALTHY,
+                account_healthy=account.status
+                in {
+                    MarketplaceAccountStatus.HEALTHY,
+                    MarketplaceAccountStatus.ACTIVE,
+                },
                 expected_profit=expected_profit,
                 duplicate_active=duplicate is not None,
                 reserved=bool(reservations),
@@ -471,7 +587,11 @@ class MarketplaceService:
             requested_set = set(requested)
             return [a for a in accounts if a.id in requested_set]
         strategy = self._marketplace.cross_listing.strategy
-        healthy = [a for a in accounts if a.status is MarketplaceAccountStatus.HEALTHY]
+        healthy = [
+            a
+            for a in accounts
+            if a.status in {MarketplaceAccountStatus.HEALTHY, MarketplaceAccountStatus.ACTIVE}
+        ]
         if strategy == "single":
             return healthy[:1]
         if strategy == "preferred":
@@ -523,6 +643,47 @@ class MarketplaceService:
                 recs = PricingRecommendationRepository(session).list_for_item(item_id)
                 if recs:
                     price = recs[-1].recommended_price
+                ebay_projection: dict[str, Any] | None = None
+                if account.marketplace.value == "ebay" and account.automation_mode in {
+                    AutomationMode.SANDBOX,
+                    AutomationMode.CANARY,
+                    AutomationMode.PRODUCTION,
+                }:
+                    from goliath.db.domain_repositories import (
+                        ListingDraftRepository,
+                        MarketplaceVariantRepository,
+                    )
+                    from goliath.db.models import DraftStatus
+
+                    approved = [
+                        draft
+                        for draft in ListingDraftRepository(session).list(limit=200)
+                        if draft.inventory_item_id == item_id
+                        and draft.status is DraftStatus.APPROVED
+                    ]
+                    variants = (
+                        list(MarketplaceVariantRepository(session).list_for_draft(approved[-1].id))
+                        if approved
+                        else []
+                    )
+                    variant = next(
+                        (
+                            value
+                            for value in variants
+                            if value.marketplace.value == "ebay"
+                            and value.status is DraftStatus.APPROVED
+                        ),
+                        None,
+                    )
+                    if variant is not None:
+                        ebay_projection = {
+                            "title": variant.marketplace_title,
+                            "description": variant.marketplace_description or "",
+                            "price": variant.proposed_price,
+                            "category": variant.category_mapping,
+                            "image_urls": list(variant.image_order),
+                            "attributes": dict(variant.item_specifics),
+                        }
                 session.commit()
             if outcome.decision != "allow":
                 results[label] = "blocked"
@@ -544,11 +705,19 @@ class MarketplaceService:
 
             request = ListingRequest(
                 inventory_item_id=str(item_id),
-                title=fresh_item.title,
-                description=fresh_item.description or "",
-                price=price,
+                title=(ebay_projection or {}).get("title") or fresh_item.title,
+                description=(ebay_projection or {}).get("description")
+                or fresh_item.description
+                or "",
+                price=(ebay_projection or {}).get("price") or price,
                 currency=account.currency,
+                category=(ebay_projection or {}).get("category"),
+                image_keys=(ebay_projection or {}).get("image_urls", []),
                 idempotency_key=idem,
+                attributes={
+                    **(ebay_projection or {}).get("attributes", {}),
+                    "image_urls": (ebay_projection or {}).get("image_urls", []),
+                },
             )
             receipt = await self._gateway.execute(
                 account_id=account.id,
@@ -557,7 +726,7 @@ class MarketplaceService:
                 principal_scopes=principal_scopes,
                 idempotency_key=idem,
                 adapter_call=lambda adapter, r=request: adapter.create_listing(r),
-                verify_call=lambda adapter, key=idem: self._verify_listing_active(adapter, key),
+                verify_call=lambda adapter, r=request: self._verify_listing_active(adapter, r),
                 agent_identity=actor,
                 resource_type="remote_listing",
                 resource_id=listing_id,
@@ -623,14 +792,18 @@ class MarketplaceService:
         return await self.publish_item(item_id, **kwargs)
 
     @staticmethod
-    async def _verify_listing_active(adapter, idempotency_key: str) -> bool:
+    async def _verify_listing_active(adapter, request: ListingRequest) -> bool:
         # Verify the exact idempotent publish, not merely any active listing.
         result = await adapter.read_listings()
         if not result.ok:
             return False
         listings = result.data.get("listings", [])
         return any(
-            str(x.get("status")) == "active" and x.get("idempotency_key") == idempotency_key
+            str(x.get("status")) == "active"
+            and (
+                x.get("idempotency_key") == request.idempotency_key
+                or x.get("sku") == f"goliath-{request.inventory_item_id}"
+            )
             for x in listings
         )
 
@@ -882,13 +1055,21 @@ class MarketplaceService:
             buyer_ref = hashlib.sha256(str(raw["buyer"]).encode()).hexdigest()[:16]
         item_id = raw.get("inventory_item_id")
         with self._session_factory() as session:
+            remote_listing_id = raw.get("remote_listing_id")
+            if not item_id and remote_listing_id:
+                remote_listing = RemoteListingRepository(session).get_by_remote_identity(
+                    account_id=account_id,
+                    remote_listing_id=str(remote_listing_id),
+                )
+                if remote_listing is not None:
+                    item_id = str(remote_listing.inventory_item_id)
             order, is_new = MarketplaceOrderRepository(session).upsert(
                 account_id=account_id,
                 remote_order_id=str(raw["remote_order_id"]),
                 sale_price=Decimal(str(raw.get("sale_price", "0"))),
                 status=OrderStatus(raw.get("status", "unknown")),
                 payload_checksum=checksum,
-                remote_listing_id=raw.get("remote_listing_id"),
+                remote_listing_id=remote_listing_id,
                 inventory_item_id=UUID(item_id) if item_id else None,
                 buyer_reference=buyer_ref,
                 shipping_charged=Decimal(str(raw.get("shipping_charged", "0"))),

@@ -9,17 +9,27 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 AUTOMATION_MODES = (
+    "fake",
+    "simulation",
     "disabled",
     "observe",
     "shadow",
+    "sandbox",
+    "canary",
+    "production",
     "autonomous_conservative",
     "autonomous_normal",
     "paused",
 )
 AutomationModeLiteral = Literal[
+    "fake",
+    "simulation",
     "disabled",
     "observe",
     "shadow",
+    "sandbox",
+    "canary",
+    "production",
     "autonomous_conservative",
     "autonomous_normal",
     "paused",
@@ -589,6 +599,11 @@ class MarketplaceAccountConfig(BaseModel):
     capabilities: set[str] = Field(default_factory=set)
     allowed_domains: list[str] = Field(default_factory=list)
     operation_modes: dict[str, AutomationModeLiteral] = Field(default_factory=dict)
+    ebay_marketplace_id: str = "EBAY_US"
+    merchant_location_key: str | None = None
+    payment_policy_id: str | None = None
+    fulfillment_policy_id: str | None = None
+    return_policy_id: str | None = None
 
     @model_validator(mode="after")
     def domains_present(self) -> MarketplaceAccountConfig:
@@ -619,6 +634,73 @@ class MarketplaceAccountConfig(BaseModel):
         return self
 
 
+class EbayOAuthConfig(BaseModel):
+    """References only: client secrets and tokens never belong in configuration files."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    client_id_env: str = "GOLIATH_EBAY_CLIENT_ID"
+    client_secret_env: str = "GOLIATH_EBAY_CLIENT_SECRET"
+    redirect_uri: str | None = None
+    sandbox_authorization_url: str = "https://auth.sandbox.ebay.com/oauth2/authorize"
+    production_authorization_url: str = "https://auth.ebay.com/oauth2/authorize"
+    sandbox_token_url: str = "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
+    production_token_url: str = "https://api.ebay.com/identity/v1/oauth2/token"
+    scopes: list[str] = Field(
+        default_factory=lambda: [
+            "https://api.ebay.com/oauth/api_scope/sell.account.readonly",
+            "https://api.ebay.com/oauth/api_scope/sell.inventory",
+            "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
+        ]
+    )
+    state_ttl_seconds: int = Field(default=600, ge=60, le=1800)
+    token_refresh_margin_seconds: int = Field(default=300, ge=30, le=3600)
+
+    @model_validator(mode="after")
+    def validate_oauth(self) -> EbayOAuthConfig:
+        for name in (self.client_id_env, self.client_secret_env):
+            if not name.startswith("GOLIATH_EBAY_") or not name.replace("_", "").isalnum():
+                raise ValueError("invalid eBay credential environment reference")
+        if self.enabled and not self.redirect_uri:
+            raise ValueError("enabled eBay OAuth requires a redirect URI")
+        if self.redirect_uri:
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(self.redirect_uri)
+            loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            if parsed.scheme != "https" and not (loopback and parsed.scheme == "http"):
+                raise ValueError("eBay OAuth redirect must use HTTPS or loopback HTTP")
+            if parsed.fragment or parsed.username or parsed.password:
+                raise ValueError("invalid eBay OAuth redirect URI")
+        return self
+
+
+class MarketplaceTransportConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connect_timeout_seconds: float = Field(default=5, gt=0, le=60)
+    read_timeout_seconds: float = Field(default=20, gt=0, le=120)
+    total_timeout_seconds: float = Field(default=30, gt=0, le=180)
+    max_response_bytes: int = Field(default=2_000_000, ge=1024, le=20_000_000)
+    max_retries: int = Field(default=2, ge=0, le=5)
+
+
+class CanaryConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_account_ids: set[str] = Field(default_factory=set)
+    allowed_inventory_ids: set[str] = Field(default_factory=set)
+    allowed_operations: set[str] = Field(default_factory=set)
+    maximum_writes_per_hour: int = Field(default=10, ge=1, le=1000)
+    maximum_listings_per_day: int = Field(default=5, ge=1, le=1000)
+    maximum_label_cost: Decimal = Field(default=Decimal(0), ge=0)
+    maximum_price_change_percent: Decimal = Field(default=Decimal(10), gt=0, le=100)
+    maximum_offer_value: Decimal = Field(default=Decimal(0), ge=0)
+    mandatory_verification: bool = True
+    automatic_stop_failures: int = Field(default=2, ge=1, le=100)
+
+
 class MarketplaceAutomationConfig(BaseModel):
     """Typed configuration for milestone-six autonomous marketplace operations."""
 
@@ -627,6 +709,9 @@ class MarketplaceAutomationConfig(BaseModel):
     default_mode: AutomationModeLiteral = "disabled"
     operation_modes: dict[str, AutomationModeLiteral] = Field(default_factory=dict)
     session: SessionEncryptionConfig = Field(default_factory=SessionEncryptionConfig)
+    ebay_oauth: EbayOAuthConfig = Field(default_factory=EbayOAuthConfig)
+    transport: MarketplaceTransportConfig = Field(default_factory=MarketplaceTransportConfig)
+    canary: CanaryConfig = Field(default_factory=CanaryConfig)
     accounts: dict[str, MarketplaceAccountConfig] = Field(default_factory=dict)
     publishing: PublishingRules = Field(default_factory=PublishingRules)
     cross_listing: CrossListingRules = Field(default_factory=CrossListingRules)
@@ -672,7 +757,13 @@ class MarketplaceAutomationConfig(BaseModel):
         unknown = set(self.operation_modes) - set(MARKETPLACE_OPERATIONS)
         if unknown:
             raise ValueError(f"unsupported marketplace operations: {', '.join(sorted(unknown))}")
-        autonomous = {"autonomous_conservative", "autonomous_normal"}
+        autonomous = {
+            "sandbox",
+            "canary",
+            "production",
+            "autonomous_conservative",
+            "autonomous_normal",
+        }
         modes = {self.default_mode} | {a.automation_mode for a in self.accounts.values()}
         if modes & autonomous:
             if self.publishing.minimum_expected_profit <= 0:
@@ -681,6 +772,11 @@ class MarketplaceAutomationConfig(BaseModel):
                 raise ValueError("autonomous mode requires minimum-profit rules")
             if not self.session.encryption_key and not os.environ.get("GOLIATH_SESSION_KEY"):
                 raise ValueError("autonomous mode requires a persistent session encryption key")
+        if "production" in modes:
+            if not self.ebay_oauth.enabled:
+                raise ValueError("production mode requires eBay authentication")
+            if not self.canary.allowed_operations:
+                raise ValueError("production rollout requires explicitly allowed operations")
         return self
 
 

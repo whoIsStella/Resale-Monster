@@ -159,6 +159,21 @@ class AuthenticateRequest(BaseModel):
     session_state_b64: str
 
 
+class MarketplaceConnectRequest(BaseModel):
+    account_id: UUID
+    sandbox: bool = True
+
+
+class MarketplaceReauthenticateRequest(BaseModel):
+    sandbox: bool = True
+
+
+class OAuthCallbackRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=4096)
+    state: str = Field(min_length=20, max_length=512)
+    sandbox: bool = True
+
+
 class PublishRequest(BaseModel):
     item_id: str
     account_ids: list[str] | None = None
@@ -1207,6 +1222,8 @@ def create_app(
     def _marketplace_error(error: Exception) -> HTTPException:
         from goliath.db.repositories import RecordNotFoundError as _NF
         from goliath.db.repositories import VersionConflictError as _VC
+        from goliath.marketplace.broker import SessionBrokerError
+        from goliath.marketplace.ebay_auth import EbayOAuthError
         from goliath.marketplace.gateway import GatewayError
         from goliath.marketplace.service import MarketplaceServiceError
 
@@ -1217,6 +1234,8 @@ def create_app(
         if isinstance(error, GatewayError):
             return HTTPException(status_code=403, detail=str(error))
         if isinstance(error, MarketplaceServiceError | ValueError):
+            return HTTPException(status_code=422, detail=str(error))
+        if isinstance(error, EbayOAuthError | SessionBrokerError):
             return HTTPException(status_code=422, detail=str(error))
         raise error
 
@@ -1288,6 +1307,22 @@ def create_app(
             for a in marketplace_service.list_accounts()
         ]
 
+    @app.post("/marketplace-accounts/connect", dependencies=[Depends(require_scope("admin"))])
+    async def connect_marketplace_account(payload: MarketplaceConnectRequest):
+        try:
+            return marketplace_service.connect_account(payload.account_id, sandbox=payload.sandbox)
+        except Exception as error:
+            raise _marketplace_error(error) from error
+
+    @app.post("/marketplace-accounts/oauth/ebay/callback")
+    async def ebay_oauth_callback(payload: OAuthCallbackRequest):
+        try:
+            return await marketplace_service.complete_account_connection(
+                code=payload.code, state=payload.state, sandbox=payload.sandbox
+            )
+        except Exception as error:
+            raise _marketplace_error(error) from error
+
     @app.post(
         "/marketplace-accounts", status_code=201, dependencies=[Depends(require_scope("admin"))]
     )
@@ -1322,6 +1357,63 @@ def create_app(
                 "consecutive_failures": a.consecutive_failures,
                 "version": a.version,
             }
+        except Exception as error:
+            raise _marketplace_error(error) from error
+
+    @app.get(
+        "/marketplace-accounts/{account_id}/connection",
+        dependencies=[Depends(require_scope("marketplace:read"))],
+    )
+    async def marketplace_account_connection(account_id: UUID):
+        try:
+            return marketplace_service.account_connection(account_id)
+        except Exception as error:
+            raise _marketplace_error(error) from error
+
+    @app.get(
+        "/marketplace-accounts/{account_id}/capabilities",
+        dependencies=[Depends(require_scope("marketplace:read"))],
+    )
+    async def marketplace_account_capabilities(account_id: UUID):
+        try:
+            return marketplace_service.capabilities(account_id)
+        except Exception as error:
+            raise _marketplace_error(error) from error
+
+    @app.post("/marketplace-accounts/{account_id}/reauthenticate")
+    async def reauthenticate_marketplace_account(
+        account_id: UUID,
+        payload: MarketplaceReauthenticateRequest,
+        _current: Annotated[ApiPrincipal, Depends(require_scope("admin"))],
+    ):
+        try:
+            return await marketplace_service.reauthenticate_account(
+                account_id, sandbox=payload.sandbox
+            )
+        except Exception as error:
+            raise _marketplace_error(error) from error
+
+    @app.post("/marketplace-accounts/{account_id}/disconnect")
+    async def disconnect_marketplace_account(
+        account_id: UUID,
+        _current: Annotated[ApiPrincipal, Depends(require_scope("admin"))],
+    ):
+        try:
+            return await marketplace_service.disconnect_account(account_id)
+        except Exception as error:
+            raise _marketplace_error(error) from error
+
+    @app.post("/marketplace-accounts/{account_id}/validate")
+    async def validate_marketplace_account(
+        account_id: UUID,
+        current: Annotated[ApiPrincipal, Depends(require_scope("marketplace:read"))],
+    ):
+        try:
+            return _receipt_json(
+                await marketplace_service.validate_account(
+                    account_id, principal_scopes=_scopes(current)
+                )
+            )
         except Exception as error:
             raise _marketplace_error(error) from error
 
@@ -1393,6 +1485,60 @@ def create_app(
             }
             for x in listings
         ]
+
+    @app.get("/remote-listings", dependencies=[Depends(require_scope("marketplace:read"))])
+    async def remote_listings_alias(
+        status_filter: str | None = None, limit: int = 100, offset: int = 0
+    ):
+        return await list_listings(status_filter=status_filter, limit=limit, offset=offset)
+
+    @app.get(
+        "/remote-listings/{listing_id}",
+        dependencies=[Depends(require_scope("marketplace:read"))],
+    )
+    async def get_remote_listing(listing_id: UUID):
+        from goliath.db.marketplace_repositories import RemoteListingRepository
+
+        with session_factory() as session:
+            listing = RemoteListingRepository(session).get(listing_id)
+            if listing is None:
+                raise HTTPException(status_code=404, detail="remote listing not found")
+            return {
+                "id": str(listing.id),
+                "account_id": str(listing.account_id),
+                "inventory_item_id": str(listing.inventory_item_id),
+                "remote_listing_id": listing.remote_listing_id,
+                "status": listing.status.value,
+                "sync_state": listing.sync_state.value,
+                "price": str(listing.current_price) if listing.current_price is not None else None,
+                "currency": listing.currency,
+                "quantity": listing.quantity,
+                "last_synced_at": listing.last_synced_at,
+            }
+
+    @app.get(
+        "/marketplace-operations/{operation_id}",
+        dependencies=[Depends(require_scope("marketplace:read"))],
+    )
+    async def get_marketplace_operation(operation_id: UUID):
+        from goliath.db.marketplace_repositories import OperationAttemptRepository
+
+        with session_factory() as session:
+            operation = OperationAttemptRepository(session).get(operation_id)
+            if operation is None:
+                raise HTTPException(status_code=404, detail="marketplace operation not found")
+            return {
+                "id": str(operation.id),
+                "account_id": str(operation.account_id),
+                "operation": operation.operation,
+                "status": operation.status.value,
+                "verification_status": operation.verification_status.value,
+                "remote_identifier": operation.remote_identifier,
+                "attempt_count": operation.attempt_count,
+                "created_at": operation.created_at,
+                "completed_at": operation.completed_at,
+                "error_category": operation.error_category,
+            }
 
     @app.post("/marketplace-listings/publish", status_code=201)
     async def publish_listing(

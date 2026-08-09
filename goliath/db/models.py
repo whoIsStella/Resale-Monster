@@ -1309,9 +1309,14 @@ class ReviewTaskEvent(Base):
 
 
 class AutomationMode(StrEnum):
+    FAKE = "fake"
+    SIMULATION = "simulation"
     DISABLED = "disabled"
     OBSERVE = "observe"
     SHADOW = "shadow"
+    SANDBOX = "sandbox"
+    CANARY = "canary"
+    PRODUCTION = "production"
     AUTONOMOUS_CONSERVATIVE = "autonomous_conservative"
     AUTONOMOUS_NORMAL = "autonomous_normal"
     PAUSED = "paused"
@@ -1319,7 +1324,13 @@ class AutomationMode(StrEnum):
 
 # Modes that permit real marketplace writes.
 AUTONOMOUS_WRITE_MODES: frozenset[AutomationMode] = frozenset(
-    {AutomationMode.AUTONOMOUS_CONSERVATIVE, AutomationMode.AUTONOMOUS_NORMAL}
+    {
+        AutomationMode.SANDBOX,
+        AutomationMode.CANARY,
+        AutomationMode.PRODUCTION,
+        AutomationMode.AUTONOMOUS_CONSERVATIVE,
+        AutomationMode.AUTONOMOUS_NORMAL,
+    }
 )
 
 
@@ -1328,10 +1339,12 @@ class MarketplaceAccountStatus(StrEnum):
     AUTHENTICATION_REQUIRED = "authentication_required"
     CONNECTING = "connecting"
     HEALTHY = "healthy"
+    ACTIVE = "active"
     DEGRADED = "degraded"
     RATE_LIMITED = "rate_limited"
     CHALLENGED = "challenged"
     SUSPENDED = "suspended"
+    REVOKED = "revoked"
     DISABLED = "disabled"
 
 
@@ -1342,6 +1355,7 @@ WRITE_FORBIDDEN_ACCOUNT_STATUSES: frozenset[MarketplaceAccountStatus] = frozense
         MarketplaceAccountStatus.SUSPENDED,
         MarketplaceAccountStatus.DISABLED,
         MarketplaceAccountStatus.AUTHENTICATION_REQUIRED,
+        MarketplaceAccountStatus.REVOKED,
     }
 )
 
@@ -1449,6 +1463,14 @@ class OperationStatus(StrEnum):
     SHADOWED = "shadowed"
 
 
+class VerificationStatus(StrEnum):
+    PENDING = "pending"
+    VERIFIED = "verified"
+    MISMATCHED = "mismatched"
+    UNAVAILABLE = "unavailable"
+    FAILED = "failed"
+
+
 class MarketplaceAccount(Base):
     __tablename__ = "marketplace_accounts"
     __table_args__ = (
@@ -1476,6 +1498,17 @@ class MarketplaceAccount(Base):
         default=MarketplaceAccountStatus.DISCONNECTED,
     )
     capabilities: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    remote_account_identifier: Mapped[str | None] = mapped_column(String(200))
+    display_seller_name: Mapped[str | None] = mapped_column(String(100))
+    granted_scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    credential_version: Mapped[int | None] = mapped_column(Integer)
+    authentication_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_authentication_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failed_authentication_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    degradation_reason: Mapped[str | None] = mapped_column(Text)
+    disabled_reason: Mapped[str | None] = mapped_column(Text)
     session_reference: Mapped[str | None] = mapped_column(String(200))
     session_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_authenticated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -1587,6 +1620,7 @@ class MarketplaceOperationAttempt(Base):
     operation: Mapped[str] = mapped_column(String(80), nullable=False)
     resource_type: Mapped[str | None] = mapped_column(String(80))
     resource_id: Mapped[UUID | None] = mapped_column(Uuid)
+    job_id: Mapped[UUID | None] = mapped_column(Uuid)
     idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[OperationStatus] = mapped_column(
         enum_type(OperationStatus, "operation_status"),
@@ -1595,9 +1629,23 @@ class MarketplaceOperationAttempt(Base):
     )
     automation_mode: Mapped[str] = mapped_column(String(50), nullable=False)
     request_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    requested_payload_hash: Mapped[str | None] = mapped_column(String(64))
     result_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     remote_identifier: Mapped[str | None] = mapped_column(String(200))
+    remote_request_id: Mapped[str | None] = mapped_column(String(200))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    verification_status: Mapped[VerificationStatus] = mapped_column(
+        enum_type(VerificationStatus, "marketplace_verification_status"),
+        nullable=False,
+        default=VerificationStatus.PENDING,
+    )
+    first_attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    last_attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
     error_category: Mapped[str | None] = mapped_column(String(100))
     agent_identity: Mapped[str | None] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(
@@ -1923,6 +1971,50 @@ class WebhookEvent(Base):
     processed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class OAuthStateRecord(Base):
+    """Single-use OAuth state. Contains no token or client credential."""
+
+    __tablename__ = "oauth_state_records"
+    __table_args__ = (
+        UniqueConstraint("state_digest", name="oauth_state_digest"),
+        Index("ix_oauth_state_account", "account_id", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    state_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    redirect_uri: Mapped[str] = mapped_column(String(1000), nullable=False)
+    requested_scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class MarketplaceRateLimitState(Base):
+    __tablename__ = "marketplace_rate_limit_state"
+    __table_args__ = (
+        UniqueConstraint("account_id", "operation_family", name="rate_limit_account_family"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("marketplace_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    operation_family: Mapped[str] = mapped_column(String(80), nullable=False)
+    allowance: Mapped[int | None] = mapped_column(Integer)
+    reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retry_after_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    throttle_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    safety_margin: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
     )
 
 

@@ -600,9 +600,7 @@ class ListingDraftRepository:
         statement = select(MasterListingDraft)
         if status is not None:
             statement = statement.where(MasterListingDraft.status == status)
-        statement = (
-            statement.order_by(MasterListingDraft.created_at).limit(limit).offset(offset)
-        )
+        statement = statement.order_by(MasterListingDraft.created_at).limit(limit).offset(offset)
         return self._session.scalars(statement).all()
 
     def list_versions(self, draft_id: UUID) -> Sequence[ListingDraftVersion]:
@@ -711,6 +709,20 @@ class MarketplaceVariantRepository:
     def get(self, variant_id: UUID) -> MarketplaceDraftVariant | None:
         return self._session.get(MarketplaceDraftVariant, variant_id)
 
+    def set_status(self, variant_id: UUID, *, status: Any) -> MarketplaceDraftVariant:
+        variant = self.get(variant_id)
+        if variant is None:
+            raise RecordNotFoundError(f"marketplace variant not found: {variant_id}")
+        from goliath.db.models import DraftStatus
+
+        if variant.status is DraftStatus.APPROVED and status is not DraftStatus.SUPERSEDED:
+            raise InvalidStateTransitionError(
+                "approved marketplace variants may only be superseded"
+            )
+        variant.status = status
+        self._session.flush()
+        return variant
+
     def list_for_draft(self, draft_id: UUID) -> Sequence[MarketplaceDraftVariant]:
         return self._session.scalars(
             select(MarketplaceDraftVariant)
@@ -816,9 +828,7 @@ class DomainProposalRepository:
         now = now or utc_now()
         proposal = self._require(proposal_id)
         if proposal.status is not ProposalStatus.PENDING:
-            raise InvalidStateTransitionError(
-                f"proposal is not pending: {proposal.status.value}"
-            )
+            raise InvalidStateTransitionError(f"proposal is not pending: {proposal.status.value}")
         if proposal.expires_at is not None and _utc(proposal.expires_at) <= now:
             proposal.status = ProposalStatus.EXPIRED
             self._session.flush()
@@ -832,9 +842,7 @@ class DomainProposalRepository:
         self._session.flush()
         return proposal
 
-    def mark_executed(
-        self, proposal_id: UUID, *, error: str | None = None
-    ) -> DomainProposal:
+    def mark_executed(self, proposal_id: UUID, *, error: str | None = None) -> DomainProposal:
         proposal = self._require(proposal_id)
         if proposal.status is not ProposalStatus.APPROVED:
             raise InvalidStateTransitionError("only approved proposals can be executed")
@@ -946,9 +954,7 @@ class MarketplaceConstraintRepository:
 
     def list(self) -> Sequence[MarketplaceConstraintVersion]:
         return self._session.scalars(
-            select(MarketplaceConstraintVersion).order_by(
-                MarketplaceConstraintVersion.marketplace
-            )
+            select(MarketplaceConstraintVersion).order_by(MarketplaceConstraintVersion.marketplace)
         ).all()
 
 
