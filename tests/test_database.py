@@ -95,6 +95,8 @@ def test_initial_migration_upgrades_and_downgrades_sqlite(tmp_path: Path) -> Non
         "review_tasks",
         "review_task_events",
         "marketplace_accounts",
+        "marketplace_rate_limit_state",
+        "oauth_state_records",
         "session_references",
         "remote_listings",
         "marketplace_operation_attempts",
