@@ -97,16 +97,7 @@ def upgrade() -> None:
         batch.add_column(
             sa.Column(
                 "verification_status",
-                sa.Enum(
-                    "pending",
-                    "verified",
-                    "mismatched",
-                    "unavailable",
-                    "failed",
-                    name="marketplace_verification_status",
-                    native_enum=False,
-                    create_constraint=True,
-                ),
+                sa.String(length=11),
                 nullable=False,
                 server_default="pending",
             )
@@ -128,8 +119,20 @@ def upgrade() -> None:
             )
         )
 
+    with op.batch_alter_table("marketplace_operation_attempts") as batch:
+        batch.create_check_constraint(
+            "ck_marketplace_operation_attempts_marketplace_verification_status",
+            "verification_status IN ('pending', 'verified', 'mismatched', 'unavailable', 'failed')",
+        )
+
 
 def downgrade() -> None:
+    with op.batch_alter_table("marketplace_operation_attempts") as batch:
+        batch.drop_constraint(
+            "ck_marketplace_operation_attempts_marketplace_verification_status",
+            type_="check",
+        )
+
     with op.batch_alter_table("marketplace_operation_attempts") as batch:
         batch.drop_column("last_attempted_at")
         batch.drop_column("first_attempted_at")
