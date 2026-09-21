@@ -109,8 +109,6 @@ Marketplace access is isolated behind typed adapters and account policy.
 
 Accounts can operate in observe, shadow, paused, or explicitly enabled autonomous modes. Writes pass through scope, policy, health, idempotency, breaker, and verification checks before execution.
 
-Session state is kept outside agent workspaces. Agents do not receive browser cookies, marketplace tokens, payout access, or raw session data.
-
 ## MCP
 
 The MCP layer exposes bounded tools for inventory, research, pricing, listings, approvals, reviews, comparables, and enabled marketplace operations.
@@ -151,16 +149,6 @@ playwright install chromium
 ```
 
 Use PostgreSQL, keep session storage outside the repository and agent workspaces, and keep secrets in the service environment.
-
-## Security boundaries
-
-- no unrestricted SQL or shell surface is exposed to agents
-- secrets are rejected from agent environment allowlists
-- credentials stay behind dedicated application boundaries
-- session state is not returned through API, MCP, logs, or audit events
-- privileged marketplace writes require explicit policy and scope
-- emergency stops and circuit breakers block writes while allowing safe reads
-- destructive or ambiguous resale actions are escalated instead of guessed
 
 ## Repository layout
 
