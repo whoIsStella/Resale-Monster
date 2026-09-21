@@ -79,10 +79,11 @@ def test_dashboard_requires_scope(client) -> None:
 
 def test_all_protected_routes_execute_authorization_dependencies(client) -> None:
     api, *_ = client
+    public_paths = {"/health", "/ready", "/marketplace-accounts/oauth/ebay/callback"}
     routes = [
         route
         for route in api.app.routes
-        if isinstance(route, APIRoute) and route.path not in {"/health", "/ready"}
+        if isinstance(route, APIRoute) and route.path not in public_paths
     ]
 
     assert routes
