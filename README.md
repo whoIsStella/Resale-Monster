@@ -1,164 +1,83 @@
 # Resale Goliath
 
-Resale Goliath is a resale operations platform built around typed workflows, durable job execution, marketplace adapters, and tightly scoped agent access.
+I built this around a resale workflow question: how can software agents help with inventory, pricing, and listings without receiving the marketplace's credentials or unrestricted execution power? Goliath puts typed services, durable jobs, and account policy between a proposal and an external action.
 
-The system separates engineering work, resale-domain logic, and live marketplace operations. Agents can research, draft, analyze, and request actions, but credentials and privileged marketplace operations stay behind application-controlled interfaces.
+**Working backend, still under development.** FastAPI, PostgreSQL, SQLAlchemy/Alembic, a Typer CLI, and MCP are implemented. Offline tests exercise the workflow and failure paths; live marketplace behavior is a separate, opt-in test layer.
 
-## What it includes
+## The interesting engineering
 
-- FastAPI API and Typer CLI
-- PostgreSQL, SQLAlchemy, and Alembic migrations
-- durable jobs, workers, leases, retries, cancellation, and recovery
-- typed inventory, research, pricing, listing, approval, and review workflows
-- MCP tools with scoped service principals
-- image ingestion and metadata processing
-- configurable marketplace adapters
-- audit events, idempotency, circuit breakers, and emergency stops
-- unit and integration test layers
+- Jobs survive process restarts: workers claim leases, heartbeat, retry, cancel, and recover work through versioned state transitions.
+- Inventory, comparables, pricing, drafts, and approvals use typed workflows rather than arbitrary SQL or generic account mutation.
+- Human API principals, MCP service principals, workers, and marketplace accounts have distinct identities and scopes.
+- Marketplace writes pass through policy, idempotency, account health, circuit breakers, emergency stops, and read-back verification.
+- Marketplace sessions stay behind the broker and adapters. Agent subprocesses receive an allowlisted environment.
 
-## Architecture
+## Boundaries
 
-```text
-CLI / API / MCP
-      |
-      v
-typed services and policy checks
-      |
-      +--> PostgreSQL
-      |
-      +--> durable job queue --> worker --> supervised agent process
-      |
-      +--> marketplace gateway --> isolated adapter --> marketplace
+```mermaid
+flowchart TB
+    ENTRY["CLI / API / MCP"] --> SERVICE["Typed services and policy"]
+    SERVICE --> DB["PostgreSQL and audit events"]
+    SERVICE --> JOB["Durable jobs and leased workers"]
+    JOB --> AGENT["Configured agent subprocess"]
+    SERVICE --> GATE["Marketplace gateway"]
+    GATE --> ADAPTER["Session broker and typed adapter"]
 ```
 
-The application does not expose generic SQL, shell access, browser profiles, marketplace credentials, or unrestricted browser controls to agents.
+The MCP interface has no generic shell, SQL, cookie, or browser-profile tool.
+Configured coding agents can run commands inside their allowed workspace;
+permissions passed to an agent are not an OS sandbox. The adapter, host
+permissions, and deployment isolation still matter.
 
-## Job lifecycle
+Leases coordinate claims and completion; they are not an exactly-once guarantee
+for external effects. Idempotency and verification address that separate problem.
 
-```text
-pending -> queued -> running -> succeeded
-   |          |         |-----> failed
-   |          |         |-----> timed_out
-   +----------+---------+-----> cancelled
-```
+## Run locally
 
-Jobs use versioned compare-and-swap updates. Workers claim queued jobs with leases so competing workers cannot execute the same job at the same time.
-
-## Setup
-
-Requirements:
-
-- Python 3.11+
-- PostgreSQL for normal development and production use
-- optional Playwright/Chromium support for marketplace adapters
-
-Create a virtual environment and install the project:
+Python 3.11+ and PostgreSQL are required for the normal application. SQLite is used only by the isolated test layer.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
-```
+pip install 'psycopg[binary]>=3,<4'
 
-Create the agent configuration:
-
-```bash
 cp config/agents.example.yaml config/agents.yaml
 export GOLIATH_CONFIG="$PWD/config/agents.yaml"
 export GOLIATH_DATABASE_URL='postgresql+psycopg://user:password@localhost/resale_goliath'
+# Create that database and edit workspace_roots/agent commands before proceeding.
 alembic upgrade head
-```
-
-Edit `workspace_roots` and agent settings in `config/agents.yaml` for the machine running Goliath.
-
-Database credentials belong in the application environment, not in agent configuration or prompts.
-
-## Basic CLI use
-
-```bash
 goliath agent list
 goliath agent doctor
-
-goliath job submit \
-  --agent codex \
-  --task-type code_change \
-  --workspace . \
-  --permission read_files \
-  --permission write_files \
-  --permission run_commands \
-  --capability coding \
-  --objective "Add inventory search endpoints and tests"
-
-goliath job list
-goliath job status JOB_ID
-goliath job run-next
-goliath job cancel JOB_ID --reason "Operator requested cancellation"
 ```
 
-Most CLI commands also support `--json`.
+Keep credentials in the application environment, outside agent workspaces.
+Start the API with `python -m goliath.api_runner`. Example API, worker, and
+scheduler service units live in [systemd/](systemd/).
 
-## Resale-domain workflows
-
-The domain layer covers inventory, measurements, media processing, product research, comparable review, pricing, listing drafts, approvals, marketplace synchronization, offers, messages, orders, shipping, refunds, and reconciliation.
-
-Inventory and draft updates are versioned. Agent-generated proposals do not bypass the service layer.
-
-## Marketplace operations
-
-Marketplace access is isolated behind typed adapters and account policy.
-
-Accounts can operate in observe, shadow, paused, or explicitly enabled autonomous modes. Writes pass through scope, policy, health, idempotency, breaker, and verification checks before execution.
-
-## MCP
-
-The MCP layer exposes bounded tools for inventory, research, pricing, listings, approvals, reviews, comparables, and enabled marketplace operations.
-
-Human API principals, MCP service principals, workers, and marketplace accounts use separate identities and scopes.
-
-Example configuration files are under `config/`.
-
-## Development
+## Tests and code worth reading
 
 ```bash
 pytest
 ruff check .
-alembic upgrade head
 ```
 
-The default pytest configuration skips opt-in sandbox and live marketplace tests.
+Default tests exclude sandbox and live marketplace operations. Offline SQLite
+coverage does not establish PostgreSQL locking behavior or live adapter reliability.
 
-Test markers include:
+| Path | What to inspect |
+| --- | --- |
+| [goliath/orchestration/](goliath/orchestration/) | Worker leases, job lifecycle, retries, and recovery |
+| [goliath/marketplace/gateway.py](goliath/marketplace/gateway.py) | Policy, idempotency, breakers, and receipts |
+| [goliath/marketplace/broker.py](goliath/marketplace/broker.py) | Session boundary |
+| [goliath/mcp/](goliath/mcp/) | Bounded tools and scoped principals |
+| [tests/](tests/) | Lifecycle, supervisor, API, domain, and marketplace tests |
+| [docs/ebay-adapter-design.md](docs/ebay-adapter-design.md) | eBay adapter design and limitations |
 
-- `unit`
-- `integration_fake`
-- `integration_sandbox`
-- `integration_live_read`
-- `integration_live_write`
+Browser-backed adapters need `pip install -e '.[browser]'` and
+`playwright install chromium`. They remain subject to account policy and
+marketplace-specific behavior. This is not a claim of production readiness
+across every marketplace.
 
-Live and sandbox tests are opt-in.
-
-## Deployment
-
-Example systemd units are in `systemd/` for the API, worker, and scheduler.
-
-For browser-backed adapters:
-
-```bash
-pip install -e '.[browser]'
-playwright install chromium
-```
-
-Use PostgreSQL, keep session storage outside the repository and agent workspaces, and keep secrets in the service environment.
-
-## Repository layout
-
-```text
-goliath/      application code
-config/       example configuration
-migrations/   Alembic migrations
-systemd/      example service units
-tests/        unit and integration tests
-docs/         design notes and examples
-```
-
-The repository name predates the current project name. The Python package and application are named `resale-goliath` and `goliath`.
+The repository's older name is `Resale-Monster`; the application/package is
+`resale-goliath` / `goliath`.
